@@ -1,0 +1,22 @@
+# Personal data must never live in the project, but guard anyway
+*.noindex/
+vault*/
+*.enc
+
+# Downloaded or generated
+models/*.onnx
+testdata/
+demo/
+dist/
+build/
+packaging/*.icns
+packaging/*.iconset/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# AI Agents
+.claude/

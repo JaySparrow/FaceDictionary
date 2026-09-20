@@ -1,0 +1,16 @@
+# conda env create -f environment.yml && conda activate facedict
+name: facedict
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.14
+  - numpy=2.5.3
+  - cryptography=50.0.1
+  - pillow=12.3.0
+  - pillow-heif=1.7.0
+  - pytest=9.1.1          # dev
+  - pytest-qt=4.5.0       # dev
+  - pip
+  - pip:
+      - opencv-python-headless==5.0.0.93
+      - PySide6-Essentials==6.11.2
