@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
 
 from .. import config
 from ..crypto import WrongPasswordError
-from .common import heading, muted
+from .common import appearance, heading, muted, set_appearance
 from .lock_screen import MIN_PASSWORD, RecoveryCodeDialog
 from .questions_dialog import QuestionsDialog
 
@@ -27,7 +27,7 @@ class ChangePasswordDialog(QDialog):
         for f in (self.old, self.new, self.new2):
             f.setEchoMode(QLineEdit.EchoMode.Password)
         self.error = QLabel()
-        self.error.setStyleSheet("color: #c9483c;")
+        self.error.setObjectName("error")
         form = QFormLayout()
         form.addRow("Current password", self.old)
         form.addRow("New password", self.new)
@@ -64,6 +64,12 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.setMinimumWidth(520)
 
+        self.appearance = QComboBox()
+        for label, mode in (("Follow system", "system"), ("Light", "light"), ("Dark", "dark")):
+            self.appearance.addItem(label, mode)
+        self._appearance_before = appearance()
+        self.appearance.setCurrentIndex(self.appearance.findData(self._appearance_before))
+        self.appearance.currentIndexChanged.connect(lambda _i: set_appearance(self.appearance.currentData()))
         self.model = QComboBox()
         for name in service.available_recognizers():
             spec = config.MODELS[name]
@@ -77,6 +83,7 @@ class SettingsDialog(QDialog):
         self.clear_clip.setChecked(bool(service.settings.get("clear_clipboard_after_search")))
 
         form = QFormLayout()
+        form.addRow("Appearance", self.appearance)
         form.addRow("Recognition model", self.model)
         form.addRow("", muted("Changing the model re-computes the face index in the background. "
                               "Past search results are kept as they were."))
@@ -120,6 +127,11 @@ class SettingsDialog(QDialog):
         lay.addWidget(network)
         lay.addWidget(where)
         lay.addWidget(buttons)
+
+    def reject(self) -> None:
+        if appearance() != self._appearance_before:            # Cancel: back to how it looked before
+            set_appearance(self._appearance_before)
+        super().reject()
 
     @property
     def chosen_model(self) -> str:

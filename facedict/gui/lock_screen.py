@@ -7,12 +7,13 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
-                               QLabel, QLineEdit, QMenu, QPushButton, QStackedWidget, QVBoxLayout, QWidget)
+                               QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy, QStackedWidget, QVBoxLayout,
+                               QWidget)
 
 from .. import databases
 from ..crypto import WrongPasswordError
 from ..vault import VaultInfo
-from .common import card, choose_folder, confirm, heading, muted
+from .common import choose_folder, confirm, heading, muted, semibold
 from .questions_dialog import RecoveryQuestionsForm
 
 MIN_PASSWORD = 8
@@ -26,6 +27,12 @@ def _password_field(placeholder: str) -> QLineEdit:
     return f
 
 
+def _form() -> QFormLayout:
+    form = QFormLayout()
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)    # as wide as the button
+    return form
+
+
 class DatabaseBar(QFrame):
     """Shows which database is selected and lets the user switch to another one."""
 
@@ -34,12 +41,9 @@ class DatabaseBar(QFrame):
     def __init__(self, service, parent=None):
         super().__init__(parent)
         self.service = service
-        self.setObjectName("card")
         self.path: Path | None = None
         self.name = QLabel()
-        f = self.name.font()
-        f.setBold(True)
-        self.name.setFont(f)
+        self.name.setFont(semibold(self.name.font()))
         self.where = muted()
         self.where.setWordWrap(False)
         self.button = QPushButton("Open another…")
@@ -51,7 +55,7 @@ class DatabaseBar(QFrame):
         left.addWidget(self.name)
         left.addWidget(self.where)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.addLayout(left, 1)
         lay.addWidget(self.button)
 
@@ -143,23 +147,28 @@ class LockScreen(QWidget):
         self.recover_layout.setContentsMargins(0, 0, 0, 0)
         self.pages.addWidget(self.recover_page)         # 2
         self.pages.addWidget(self._build_problem())     # 3
+        self.pages.currentChanged.connect(self._fit_page)
 
         self.error = QLabel()
-        self.error.setStyleSheet("color: #c9483c;")
+        self.error.setObjectName("error")
         self.error.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.error.setWordWrap(True)
 
-        box = card()
+        box = QWidget()                                  # no card: a column on the window itself
         inner = QVBoxLayout(box)
-        inner.setContentsMargins(28, 24, 28, 24)
-        inner.setSpacing(12)
-        inner.addWidget(title)
-        inner.addWidget(subtitle)
-        inner.addSpacing(6)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(16)
+        head = QVBoxLayout()
+        head.setSpacing(6)
+        head.addWidget(title)
+        head.addWidget(subtitle)
+        inner.addLayout(head)
+        inner.addSpacing(28)
         inner.addWidget(self.bar)
+        inner.addSpacing(8)
         inner.addWidget(self.pages)
         inner.addWidget(self.error)
-        box.setMaximumWidth(560)
+        box.setFixedWidth(440)
 
         outer = QVBoxLayout(self)
         outer.addStretch(1)
@@ -169,6 +178,14 @@ class LockScreen(QWidget):
         row.addStretch(1)
         outer.addLayout(row)
         outer.addStretch(2)
+        self._fit_page(self.pages.currentIndex())
+
+    def _fit_page(self, index: int) -> None:
+        """The pages are as tall as the one shown, not the tallest."""
+        for i in range(self.pages.count()):
+            policy = QSizePolicy.Policy.Preferred if i == index else QSizePolicy.Policy.Ignored
+            self.pages.widget(i).setSizePolicy(policy, policy)
+        self.pages.adjustSize()
 
     # --- pages -------------------------------------------------------------------------
 
@@ -181,7 +198,7 @@ class LockScreen(QWidget):
         self.create_btn.setDefault(True)
         self.create_btn.clicked.connect(self._create)
         self.new_pw2.returnPressed.connect(self._create)
-        form = QFormLayout()
+        form = _form()
         form.addRow("Password", self.new_pw)
         form.addRow("Confirm", self.new_pw2)
         self.create_hint = muted("This folder is empty. Choose a password for the new database – "
@@ -189,6 +206,7 @@ class LockScreen(QWidget):
         self.create_hint.setWordWrap(True)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
         lay.addWidget(self.create_hint)
         lay.addLayout(form)
         lay.addWidget(self.create_btn)
@@ -207,8 +225,10 @@ class LockScreen(QWidget):
         self.forgot_btn.clicked.connect(self._show_recover)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
         lay.addWidget(self.pw)
         lay.addWidget(self.unlock_btn)
+        lay.addSpacing(4)
         lay.addWidget(self.forgot_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         return w
 
@@ -341,7 +361,7 @@ class LockScreen(QWidget):
             self.recover_layout.addWidget(self.code_field)
         self.rec_pw = _password_field(f"New password, at least {MIN_PASSWORD} characters")
         self.rec_pw2 = _password_field("Repeat the new password")
-        form = QFormLayout()
+        form = _form()
         form.addRow("New password", self.rec_pw)
         form.addRow("Confirm", self.rec_pw2)
         self.recover_layout.addLayout(form)
@@ -392,7 +412,7 @@ class RecoveryCodeDialog(QDialog):
         text.setFont(f)
         text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         text.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        text.setStyleSheet("padding: 14px; border: 1px solid palette(mid); border-radius: 8px;")
+        text.setStyleSheet("padding: 14px; border: 1px solid rgba(127, 127, 127, 90); border-radius: 8px;")
         info = muted("Write this code on paper and keep it somewhere safe, offline. It can reset this "
                      "database's password even if you forget the answers to your security questions. "
                      "It will not be shown again.")

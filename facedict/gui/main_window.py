@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel, QLine
                                QVBoxLayout, QWidget)
 
 from .. import config
-from .common import (GAP, PAGE_MARGIN, Runner, default_error_handler, header_row, icon_button, line_icon,
+from .common import (GAP, ICON_ROLE, PAGE_MARGIN, Runner, default_error_handler, header_row, icon_button, line_icon,
                      make_labels_selectable)
 from .history_page import HistoryPage
 from .library_page import LibraryPage
@@ -76,7 +76,9 @@ class MainWindow(QMainWindow):
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
         for page, icon in zip(PAGES, ("search", "history", "library", "trash")):
-            self.nav.addItem(QListWidgetItem(line_icon(icon), page))
+            item = QListWidgetItem(line_icon(icon), page)
+            item.setData(ICON_ROLE, icon)
+            self.nav.addItem(item)
         self.nav.setIconSize(QSize(18, 18))
         self.nav.setFixedWidth(180)
         self.page_stack = QStackedWidget()

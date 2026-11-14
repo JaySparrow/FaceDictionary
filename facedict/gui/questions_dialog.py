@@ -65,7 +65,7 @@ class QuestionsDialog(QDialog):
         self.any_two.setChecked(True)
 
         self.error = QLabel()
-        self.error.setStyleSheet("color: #c9483c;")
+        self.error.setObjectName("error")
         self.error.setWordWrap(True)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.button(QDialogButtonBox.StandardButton.Save).setText("Save questions")

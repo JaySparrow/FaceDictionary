@@ -56,7 +56,7 @@ class ResultCard(QFrame):
         number = QLabel(f"{score:.3f}")
         number.setObjectName("muted")
         if score < low:
-            number.setStyleSheet("color: #d4761e;")             # a weak match
+            number.setProperty("weak", True)                    # orange: a weak match
         sub = ElidedLabel(subtitle)
         score_row = QHBoxLayout()
         score_row.setSpacing(8)
@@ -68,7 +68,7 @@ class ResultCard(QFrame):
         buttons.setSpacing(6)
         if state == "this":
             done = QLabel("✓ Added to album")
-            done.setStyleSheet("color: #3a9d5d; font-weight: 600;")
+            done.setObjectName("confirmed")
             undo = QPushButton("Undo")
             undo.setToolTip("Remove the search photo from this entry's album again (it goes to the Trash)")
             undo.clicked.connect(self.undo_clicked.emit)

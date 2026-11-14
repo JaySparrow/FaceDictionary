@@ -324,8 +324,8 @@ class FieldRow(QWidget):
 
     def paintEvent(self, event) -> None:
         if self.marked:
-            color = self.palette().color(QPalette.ColorRole.Highlight)
-            color.setAlpha(55)
+            color = self.palette().color(QPalette.ColorRole.Accent)
+            color.setAlpha(45)
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setPen(Qt.PenStyle.NoPen)
@@ -396,7 +396,6 @@ class PhotoGrid(QListWidget):
 
     reordered = Signal(list)                       # photo ids in the new order
     dropped = Signal(list)                         # photos dragged in from outside: Path or bytes
-    DROP_COLOR = QColor(59, 130, 246)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -532,7 +531,7 @@ class PhotoGrid(QListWidget):
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         kind, target = self._drop
-        color = self.DROP_COLOR
+        color = self.palette().color(QPalette.ColorRole.Accent)
         if kind == "swap":
             rect = self._rect(target).adjusted(2, 2, -2, -2)
             painter.setBrush(QColor(color.red(), color.green(), color.blue(), 70))

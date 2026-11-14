@@ -31,7 +31,6 @@ class TrashPage(QWidget):
         self.info = muted("Deleted items stay here until you delete them permanently. "
                           "The Trash is never emptied automatically.")
         self.restore_btn = QPushButton("Restore")
-        self.restore_btn.setObjectName("primary")
         self.restore_btn.clicked.connect(self.restore)
         self.purge_btn = QPushButton("Delete permanently…")
         self.purge_btn.clicked.connect(self.purge)

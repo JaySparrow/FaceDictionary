@@ -331,7 +331,7 @@ def test_app_settings_only_store_window_geometry(ready):
     s = QSettings()
     s.setFallbacksEnabled(False)                           # ignore macOS global-domain keys
     keys = set(s.allKeys())
-    assert keys <= {"geometry"}, f"{len(keys)} unexpected keys"
+    assert keys <= {"geometry", "appearance"}, f"{len(keys)} unexpected keys"     # window place, light/dark
 
 
 # --- choosing a face in a group photo --------------------------------------------------------------
@@ -598,6 +598,23 @@ def test_recovery_page_uses_the_code_when_there_are_no_questions(ready, qtbot):
     ls.recover_btn.click()
     qtbot.waitUntil(lambda: ready.stack.currentIndex() == 1, timeout=30000)
     assert ready.service.unlocked
+
+
+def test_appearance_setting(ready, qtbot):
+    from facedict.gui import common, settings_dialog
+    dlg = settings_dialog.SettingsDialog(ready.service, ready.runner, ready)
+    qtbot.addWidget(dlg)
+    assert dlg.appearance.currentData() == "system"
+    dlg.appearance.setCurrentIndex(dlg.appearance.findData("dark"))         # applied at once
+    assert common.appearance() == "dark"
+    dlg.reject()                                                             # Cancel: as it was
+    assert common.appearance() == "system"
+    dlg = settings_dialog.SettingsDialog(ready.service, ready.runner, ready)
+    qtbot.addWidget(dlg)
+    dlg.appearance.setCurrentIndex(dlg.appearance.findData("light"))
+    dlg.accept()
+    assert common.appearance() == "light"
+    common.set_appearance("system")
 
 
 def test_settings_show_and_set_recovery_methods(ready, qtbot, monkeypatch):
@@ -1240,3 +1257,34 @@ def test_text_can_be_selected_and_copied(ready, qtbot):
     lib.list.setCurrentRow(0)
     copy_action.trigger()
     assert lib.list.currentItem().text().splitlines()[0] in QGuiApplication.clipboard().text()
+
+
+# --- light and dark ---------------------------------------------------------------------------------
+
+def test_switching_to_dark_redraws_the_icons_and_restyles(ready, qapp):
+    """Style sheets and line icons are resolved once; a switch to dark (here: a dark palette, since the
+    offscreen platform has no colour scheme of its own) has to apply them again."""
+    from PySide6.QtGui import QColor, QPalette
+
+    def ink(icon) -> int:                                 # lightness of the strokes of an icon
+        img = icon.pixmap(24, 24).toImage()
+        pixels = [img.pixelColor(x, y) for x in range(img.width()) for y in range(img.height())]
+        return max(pixels, key=lambda c: c.alpha()).lightness()
+
+    light = QPalette(qapp.palette())
+    dark = QPalette(light)
+    for role, color in ((QPalette.ColorRole.Window, "#323232"), (QPalette.ColorRole.Base, "#171717"),
+                        (QPalette.ColorRole.WindowText, "#ffffff"), (QPalette.ColorRole.Text, "#ffffff"),
+                        (QPalette.ColorRole.ButtonText, "#ffffff")):
+        dark.setColor(role, QColor(color))
+    button, nav_item = ready.library.delete_btn, ready.nav.item(0)
+    assert ink(button.icon()) < 100 and not common.is_dark()
+    try:
+        qapp.setPalette(dark)
+        common.restyle(qapp)
+        assert common.is_dark() and common.DARK_STYLE in qapp.styleSheet()
+        assert ink(button.icon()) > 200 and ink(nav_item.icon()) > 200
+    finally:
+        qapp.setPalette(light)
+        common.restyle(qapp)
+    assert ink(button.icon()) < 100 and common.DARK_STYLE not in qapp.styleSheet()

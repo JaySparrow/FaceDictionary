@@ -293,6 +293,7 @@ def _draw_icon(p: QPainter, name: str) -> None:
 
 
 _ICONS: dict[str, QIcon] = {}
+ICON_ROLE = Qt.ItemDataRole.UserRole + 40         # a list item's line icon, by name (see restyle)
 
 
 def line_icon(name: str):
@@ -333,6 +334,7 @@ def icon_button(icon: str, tooltip: str, size: int = 28, checkable: bool = False
     b = QToolButton()
     b.setObjectName("icon")
     b.setIcon(line_icon(icon))
+    b.setProperty("line_icon", icon)
     b.setIconSize(QSize(18, 18) if size >= 26 else QSize(16, 16))
     b.setToolTip(tooltip)
     b.setFixedSize(size, size)
@@ -449,7 +451,7 @@ def mark_cover(pm: QPixmap, size: int, radius: float = 0) -> QPixmap:
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     scale = out.width() / max(1, size)
     width = max(2.0, 3.0 * scale)
-    p.setPen(QPen(QGuiApplication.palette().color(QPalette.ColorRole.Highlight), width))
+    p.setPen(QPen(QGuiApplication.palette().color(QPalette.ColorRole.Accent), width))
     p.setBrush(Qt.BrushStyle.NoBrush)
     half = width / 2
     r = max(0.0, radius * scale - half)
@@ -488,7 +490,7 @@ def divider(text: str = "") -> QWidget:
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
     line.setFrameShadow(QFrame.Shadow.Plain)
-    line.setStyleSheet("color: palette(midlight);")
+    line.setObjectName("rule")
     lay.addWidget(line, 1)
     return row
 
@@ -577,12 +579,6 @@ def make_labels_selectable(root) -> None:
 def has_focus_in(widget, focus) -> bool:
     """The keyboard focus is on `widget` or inside it (a list's viewport, say)."""
     return focus is not None and (focus is widget or widget.isAncestorOf(focus))
-
-
-def card() -> QFrame:
-    f = QFrame()
-    f.setObjectName("card")
-    return f
 
 
 def heading(text: str, size: int = 15) -> QLabel:
@@ -678,25 +674,28 @@ STYLE = """
 QFrame#card { border: none; border-radius: 10px; background: palette(base); }
 QFrame#dropzone { border: 2px solid transparent; border-radius: 14px; background: palette(base); }
 QFrame#dropzone[filled="true"] { background: transparent; }
-QFrame#dropzone[hover="true"] { border-color: palette(highlight); }
+QFrame#dropzone[hover="true"] { border-color: palette(accent); }
 QLabel#muted { color: palette(placeholder-text); font-size: 12pt; }
 QLabel#subtitle { font-size: 15pt; }
 QLabel#tags { font-size: 13pt; }
+QLabel#muted[weak="true"] { color: #d4761e; }
+QLabel#confirmed { color: #3a9d5d; font-weight: 600; }
+QLabel#error { color: #c9483c; }
 QLabel#banner { background: rgba(255, 170, 0, 40); color: palette(text); border-radius: 8px; padding: 8px 10px; }
 QProgressBar#score { border: none; border-radius: 2px; background: rgba(127, 127, 127, 50); }
-QProgressBar#score::chunk { border-radius: 2px; background: palette(highlight); }
+QProgressBar#score::chunk { border-radius: 2px; background: palette(accent); }
 QWidget#sidebar { background: rgba(127, 127, 127, 22); }
 QListWidget, QTreeWidget { border: none; background: transparent; outline: 0; }
 QListWidget::item, QTreeWidget::item { border: none; padding: 3px 4px; }
 QListWidget::item:selected, QTreeWidget::item:selected { background: palette(highlight);
                                                           color: palette(highlighted-text); border-radius: 7px; }
-QListWidget::item:selected:!active, QTreeWidget::item:selected:!active { background: palette(midlight);
+QListWidget::item:selected:!active, QTreeWidget::item:selected:!active { background: rgba(127, 127, 127, 50);
                                                                           color: palette(text); }
 QTreeWidget::item:selected { border-radius: 0px; }
 QTreeWidget::item:selected:first { border-top-left-radius: 7px; border-bottom-left-radius: 7px; }
 QTreeWidget::item:selected:last { border-top-right-radius: 7px; border-bottom-right-radius: 7px; }
 QTreeWidget { font-size: 14pt; }
-QTreeWidget QHeaderView::section { background: transparent; border: none; border-bottom: 1px solid palette(midlight);
+QTreeWidget QHeaderView::section { background: transparent; border: none; border-bottom: 1px solid rgba(127, 127, 127, 70);
                                     padding: 4px 4px; color: palette(text); font-size: 13pt; }
 QListWidget#nav { font-size: 14px; }
 QListWidget#nav::item { padding: 7px 8px; margin: 1px 6px; }
@@ -705,7 +704,66 @@ QListWidget#nav::item:selected, QListWidget#nav::item:selected:!active { backgro
 QSplitter::handle { background: transparent; image: none; }
 QToolButton#icon { border: none; background: transparent; border-radius: 6px; }
 QToolButton#icon:pressed, QToolButton#icon:checked { background: rgba(127, 127, 127, 60); }
-QPushButton#primary { font-weight: 600; }
+QFrame#rule { color: rgba(127, 127, 127, 70); }
+QPushButton#primary { background: palette(accent); color: white; border: none; border-radius: 7px; padding: 7px 18px;
+                      font-weight: 600; }
+QPushButton#primary:pressed { color: rgba(255, 255, 255, 160); }
+QPushButton#primary:disabled { background: rgba(127, 127, 127, 60); color: rgba(255, 255, 255, 190); }
 QLabel[inline="true"] { padding: 1px 0px; }
 QLabel[inline="true"][empty="true"] { color: palette(placeholder-text); }
 """
+
+DARK_STYLE = """
+QFrame#card, QFrame#dropzone { background: rgba(255, 255, 255, 12); }
+QLabel#error { color: #ff6b60; }
+"""
+
+
+def is_dark() -> bool:
+    from PySide6.QtGui import QGuiApplication, QPalette
+    return QGuiApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def style_sheet() -> str:
+    """STYLE, with lighter variants of a few colours on a dark background."""
+    return STYLE + (DARK_STYLE if is_dark() else "")
+
+
+def restyle(app) -> None:
+    """Apply the style sheet again and redraw the line icons in today's palette. Needed after a switch
+    between light and dark: both are resolved once, when applied or drawn."""
+    from PySide6.QtWidgets import QListWidget
+    _ICONS.clear()
+    app.setStyleSheet(style_sheet())
+    for w in app.allWidgets():
+        name = w.property("line_icon")
+        if name:
+            w.setIcon(line_icon(name))
+        elif isinstance(w, QListWidget):
+            for i in range(w.count()):
+                name = w.item(i).data(ICON_ROLE)
+                if name:
+                    w.item(i).setIcon(line_icon(name))
+
+
+APPEARANCES = {"system": Qt.ColorScheme.Unknown, "light": Qt.ColorScheme.Light, "dark": Qt.ColorScheme.Dark}
+
+
+def appearance() -> str:
+    """The appearance chosen in Settings: "system", "light" or "dark"."""
+    mode = QSettings().value("appearance", "system")
+    return mode if mode in APPEARANCES else "system"
+
+
+def set_appearance(mode: str, remember: bool = True) -> None:
+    QApplication.styleHints().setColorScheme(APPEARANCES[mode])     # Unknown: follow the system
+    if remember:
+        QSettings().setValue("appearance", mode)
+
+
+def follow_color_scheme(app) -> None:
+    """Style the app in the chosen appearance, and restyle it whenever it switches between light and dark."""
+    set_appearance(appearance(), remember=False)
+    app.setStyleSheet(style_sheet())
+    # the signal comes just before the palette changes
+    app.styleHints().colorSchemeChanged.connect(lambda _scheme: QTimer.singleShot(0, lambda: restyle(app)))
