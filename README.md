@@ -11,7 +11,7 @@ database, and the app runs with its network access switched off at the kernel le
 
 ## Install
 
-Download or build `FaceDictionary.dmg`, open it and drag the app into *Applications*. It carries
+Download or build `FaceDictionary-<version>.dmg`, open it and drag the app into *Applications*. The disk image also holds a short [Get Started](docs/get-started.md) guide. It carries
 everything it needs — Python, Qt, OpenCV and the face models — so nothing else has to be installed.
 
 On first start you choose a password for a new database and then three security questions that can

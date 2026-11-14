@@ -2,16 +2,17 @@
 import os
 
 application = os.environ["FACEDICT_APP"]
+guide = os.environ["FACEDICT_GUIDE"]
 appname = os.path.basename(application)
 
 format = "UDZO"                 # compressed, read-only
 size = None                     # dmgbuild works it out from the contents
 
-files = [application]
+files = [application, (guide, "Get Started.md")]
 symlinks = {"Applications": "/Applications"}
-icon_locations = {appname: (150, 190), "Applications": (450, 190)}
+icon_locations = {appname: (150, 170), "Applications": (450, 170), "Get Started.md": (300, 350)}
 
-window_rect = ((200, 180), (620, 420))
+window_rect = ((200, 180), (620, 500))
 default_view = "icon-view"
 show_status_bar = False
 show_tab_view = False

@@ -73,7 +73,7 @@ def build_dmg(app: Path) -> Path:
     print("Building the disk image …")
     dmg = ROOT / "dist" / f"FaceDictionary-{VERSION}.dmg"
     dmg.unlink(missing_ok=True)
-    env = dict(os.environ, FACEDICT_APP=str(app))
+    env = dict(os.environ, FACEDICT_APP=str(app), FACEDICT_GUIDE=str(ROOT / "docs" / "get-started.md"))
     run([sys.executable, "-m", "dmgbuild", "-s", str(ROOT / "packaging" / "dmg_settings.py"),
          "FaceDictionary", str(dmg)], env=env)
     print(f"  dmg: {dmg}  ({dmg.stat().st_size / 1e6:.0f} MB)")
@@ -108,6 +108,8 @@ def main() -> None:
     smoke_test(app)
     if not args.app_only:
         build_dmg(app)
+    shutil.rmtree(ROOT / "build", ignore_errors=True)                 # intermediates: the app has it all
+    shutil.rmtree(ROOT / "dist" / "FaceDictionary", ignore_errors=True)
     print("Done. Drag the app from the disk image into Applications.")
 
 

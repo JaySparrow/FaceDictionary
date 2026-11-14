@@ -7,6 +7,7 @@ VERSION = os.environ.get("FACEDICT_VERSION", "1.0.0")
 MODELS = os.environ.get("FACEDICT_BUNDLE_MODELS", "").split(os.pathsep)
 
 datas = [(str(PROJECT / "models" / name), "models") for name in MODELS if name]
+datas += [(str(PROJECT / name), ".") for name in ("LICENSE", "THIRD-PARTY-NOTICES.md")]     # Contents/Resources
 
 # Qt modules the app never uses; leaving them out keeps the bundle smaller
 excludes = [

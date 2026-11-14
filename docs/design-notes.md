@@ -79,7 +79,7 @@
   - 导入文件夹、导出、回收站的“永久删除”不进撤销历史；搜索页的确认保留它自己的 Undo 按钮。
 
 **打包为 macOS 应用（2026-09-20 收尾）**
-- **不再依赖终端**：`scripts/build_app.py` 用 PyInstaller 产出 `FaceDictionary.app`（约 300 MB，自带 Python、Qt、OpenCV 和模型），再用 dmgbuild 产出 `FaceDictionary-1.0.0.dmg`（约 148 MB）。双击即用，无终端窗口、无后台进程依赖。
+- **不再依赖终端**：`scripts/build_app.py` 用 PyInstaller 产出 `FaceDictionary.app`（约 300 MB，自带 Python、Qt、OpenCV 和模型），再用 dmgbuild 产出 `FaceDictionary-1.0.0.dmg`（约 148 MB）。双击即用，无终端窗口、无后台进程依赖。1.1.0 起 dmg 里只有应用、Applications 快捷方式和 `Get Started.md`（即 `docs/get-started.md`），许可证和第三方声明放进应用的 `Contents/Resources`；构建结束后删除 `build/` 和 `dist/FaceDictionary/` 这些中间产物。
 - **禁网方式改进**：原先靠 `run.command` 用 `sandbox-exec` 启动。实测发现在 .app 里"重新执行自身"会破坏 LaunchServices 注册（AppleScript 无法退出应用）。改为在进程内调用系统 `sandbox_init`，内核同样拒绝所有网络系统调用，且应用在系统里仍是正常的前台应用（实测 `lsappinfo` 显示 `type="Foreground" ... sandboxed`，网络连接数 0）。
 - **模型内置**：默认打包 YuNet + ArcFace-MBF + SFace（53 MB），首次启动无需联网；可选的 R50（174 MB）默认不打包。运行时仍校验 SHA-256。
 - **分享考虑**：`--open-models` 只打包 Apache-2.0 的两个模型，避免转发 InsightFace 的非商用权重。
