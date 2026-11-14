@@ -33,6 +33,10 @@ class DropZone(QFrame):
     def show_hint(self, on: bool) -> None:
         self.hint.setVisible(on)
         self.view.setVisible(not on)
+        self.setProperty("filled", not on)                          # no background around a photo
+        self.layout().setContentsMargins(*((14, 14, 14, 14) if on else (0, 0, 0, 0)))
+        self.style().unpolish(self)
+        self.style().polish(self)
         if on:
             self.setCursor(Qt.CursorShape.PointingHandCursor)     # the empty zone opens a file chooser
         else:

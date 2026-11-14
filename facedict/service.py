@@ -428,7 +428,20 @@ class FaceDictionaryService:
             if rec.selected != face_index:
                 rec.selected = face_index
                 v.save_history(rec)
+                self._store_thumb(rec.photo_id, decode(v.get_photo(rec.photo_id)), rec.face)   # the list shows it
             return rec
+
+    def remake_history_thumbs(self, history_ids: list[str]) -> list[str]:
+        """Make these records' thumbnails again from the face they show (older versions kept the
+        thumbnail of the first face shown). Returns the ids that were remade."""
+        v = self._v()
+        done = []
+        for hid in history_ids:
+            rec = v.get_history(hid)
+            if rec.face is not None:
+                self._store_thumb(rec.photo_id, decode(v.get_photo(rec.photo_id)), rec.face)
+                done.append(hid)
+        return done
 
     def confirm(self, history_id: str, entry_id: str, face_index: int | None = None) -> PhotoRef:
         """The user confirmed that a face in the searched photo is this entry's person:
@@ -778,6 +791,19 @@ class FaceDictionaryService:
             img = decode(v.get_photo(photo_id))
             thumb = self._store_thumb(photo_id, img, face)
         return thumb
+
+    def remake_thumbs(self, entry_id: str, photo_ids: list[str]) -> int:
+        """Make these thumbnails again, at today's size, from the photos themselves (older versions made
+        them smaller)."""
+        v = self._v()
+        entry = v.get_entry(entry_id)
+        done = 0
+        for pid in photo_ids:
+            ref = entry.photo(pid)
+            if ref is not None:
+                self._store_thumb(pid, decode(v.get_photo(pid)), ref.face)
+                done += 1
+        return done
 
     def _store_thumb(self, photo_id: str, img: np.ndarray, face: Face | None) -> bytes:
         thumb = encode_jpeg(thumbnail(img, face), quality=85)

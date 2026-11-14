@@ -45,8 +45,8 @@ class QuestionsDialog(QDialog):
         grid = QGridLayout()
         grid.setColumnStretch(0, 3)
         grid.setColumnStretch(1, 2)
-        grid.addWidget(muted("Question"), 0, 0)
-        grid.addWidget(muted("Answer"), 0, 1)
+        grid.addWidget(QLabel("Question"), 0, 0)
+        grid.addWidget(QLabel("Answer"), 0, 1)
         for i in range(N_QUESTIONS):
             box = QComboBox()
             box.setEditable(True)

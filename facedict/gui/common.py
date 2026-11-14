@@ -7,11 +7,11 @@ from typing import Callable
 
 import cv2
 import numpy as np
-from PySide6.QtCore import (QBuffer, QIODevice, QObject, QPointF, QRectF, QRunnable, QSettings, QSize, Qt,
-                            QThreadPool, Signal)
+from PySide6.QtCore import (QBuffer, QIODevice, QItemSelection, QItemSelectionModel, QObject, QPointF, QRectF,
+                            QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal)
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar,
-                               QSizePolicy, QWidget)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar,
+                               QSizePolicy, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QWidget)
 
 from ..imageio import SUPPORTED_EXTENSIONS
 from ..vault import VaultLockedError
@@ -216,18 +216,17 @@ class ElidedLabel(QLabel):
 
 
 class ScoreBar(QProgressBar):
+    """A thin similarity meter in the accent colour; the number goes in a label beside it."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("score")
         self.setRange(0, 100)
-        self.setTextVisible(True)
-        self.setFixedHeight(16)
+        self.setTextVisible(False)
+        self.setFixedHeight(4)
 
     def set_score(self, score: float, low_threshold: float) -> None:
         self.setValue(max(0, min(100, round(score * 100))))
-        self.setFormat(f"{score:.3f}")
-        color = "#3a9d5d" if score >= low_threshold + 0.15 else ("#d49a22" if score >= low_threshold else "#c9483c")
-        self.setStyleSheet(f"QProgressBar {{ border: 1px solid palette(mid); border-radius: 5px; text-align: center; "
-                           f"font-size: 11px; }} QProgressBar::chunk {{ background: {color}; border-radius: 4px; }}")
 
 
 # --- one set of thin monochrome line icons, drawn on a 24-unit grid (in the manner of Lucide) ---------
@@ -269,6 +268,19 @@ def _draw_icon(p: QPainter, name: str) -> None:
         shackle.arcTo(QRectF(8, 3, 8, 8), 180, -180)
         shackle.lineTo(16, 11)
         p.drawPath(shackle)
+    elif name == "search":
+        p.drawEllipse(QPointF(10.5, 10.5), 6.5, 6.5)
+        p.drawLine(QPointF(15.5, 15.5), QPointF(20.5, 20.5))
+    elif name == "history":                                    # a clock
+        p.drawEllipse(QPointF(12, 12), 9, 9)
+        p.drawPath(_path((12, 7), (12, 12), (15.5, 14)))
+    elif name == "library":                                    # a contact card
+        p.drawRoundedRect(QRectF(3, 4.5, 18, 15), 2.5, 2.5)
+        p.drawEllipse(QPointF(12, 10), 2.8, 2.8)
+        shoulders = QPainterPath()
+        shoulders.moveTo(7, 17.5)
+        shoulders.cubicTo(8, 14.5, 16, 14.5, 17, 17.5)
+        p.drawPath(shoulders)
     elif name in ("import", "export"):                         # a tray with an arrow into it, or out of it
         p.drawPath(_path((3, 15), (3, 21), (21, 21), (21, 15)))
         p.drawLine(QPointF(12, 3), QPointF(12, 15))
@@ -328,6 +340,86 @@ def icon_button(icon: str, tooltip: str, size: int = 28, checkable: bool = False
     return b
 
 
+class TwoLineDelegate(QStyledItemDelegate):
+    """List rows with a picture (round for people), the first line of the item's text, and the rest in
+    smaller grey type below it."""
+
+    PAD = 6
+
+    def __init__(self, picture: int, round_picture: bool, parent=None):
+        super().__init__(parent)
+        self.picture = picture
+        self.round = round_picture
+
+    def sizeHint(self, option, index) -> QSize:
+        return QSize(option.rect.width(), self.picture + 2 * self.PAD)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        from PySide6.QtGui import QFont, QFontMetrics, QPalette
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        icon = QIcon(opt.icon)                                    # a copy: opt.icon is cleared below
+        text = opt.text.replace("\u2028", "\n")                  # Qt turns line breaks into U+2028
+        opt.icon, opt.text = QIcon(), ""
+        painter.save()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)    # the selection
+        painter.restore()
+
+        rect = opt.rect.adjusted(self.PAD + 2, self.PAD, -self.PAD, -self.PAD)
+        size = self.picture
+        target = QRectF(rect.left(), rect.top() + (rect.height() - size) / 2, size, size)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if not icon.isNull():
+            ratio = widget.devicePixelRatioF() if widget else 1.0
+            pm = icon.pixmap(QSize(size, size) * 2, ratio)
+            clip = QPainterPath()
+            if self.round:
+                clip.addEllipse(target)
+            else:
+                clip.addRoundedRect(target, 6, 6)
+            painter.setClipPath(clip)
+            side = min(pm.width(), pm.height())                      # the middle square of the picture
+            source = QRectF((pm.width() - side) / 2, (pm.height() - side) / 2, side, side)
+            painter.drawPixmap(target, pm, source)
+            painter.setClipping(False)
+
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        active = bool(opt.state & QStyle.StateFlag.State_Active)
+        on_accent = selected and active and getattr(widget, "objectName", lambda: "")() != "nav"
+        palette = opt.palette
+        main = palette.color(QPalette.ColorRole.HighlightedText if on_accent else QPalette.ColorRole.Text)
+        soft = QColor(main)
+        if not on_accent:
+            soft = palette.color(QPalette.ColorRole.PlaceholderText)
+        else:
+            soft.setAlpha(200)
+        title, _, rest = text.partition("\n")
+        left = target.right() + 12
+        width = rect.right() - left
+        f1 = QFont(opt.font)
+        f1.setPointSizeF(14)
+        f2 = QFont(opt.font)
+        f2.setPointSizeF(12)
+        m1, m2 = QFontMetrics(f1), QFontMetrics(f2)
+        block = m1.height() + (m2.height() + 2 if rest else 0)
+        top = rect.top() + (rect.height() - block) / 2
+        painter.setFont(f1)
+        painter.setPen(main)
+        painter.drawText(QRectF(left, top, width, m1.height()), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         m1.elidedText(title, Qt.TextElideMode.ElideRight, int(width)))
+        if rest:
+            painter.setFont(f2)
+            painter.setPen(soft)
+            painter.drawText(QRectF(left, top + m1.height() + 2, width, m2.height()),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             m2.elidedText(rest.replace("\n", " · "), Qt.TextElideMode.ElideRight, int(width)))
+        painter.restore()
+
+
 def mark_excluded(pm: QPixmap, size: int) -> QPixmap:
     """Dim a thumbnail and draw a red “no entry” sign: this photo is not used for matching."""
     out = QPixmap(pm.size())
@@ -349,17 +441,19 @@ def mark_excluded(pm: QPixmap, size: int) -> QPixmap:
     return out
 
 
-def mark_cover(pm: QPixmap, size: int) -> QPixmap:
-    """Frame a thumbnail: this photo is the entry's cover."""
+def mark_cover(pm: QPixmap, size: int, radius: float = 0) -> QPixmap:
+    """Ring a thumbnail in the accent colour: this photo is the entry's cover."""
     from PySide6.QtGui import QGuiApplication, QPalette
     out = QPixmap(pm)
     p = QPainter(out)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    width = max(2.0, 3.0 * out.width() / max(1, size))
-    p.setPen(QPen(QGuiApplication.palette().color(QPalette.ColorRole.Text), width))
+    scale = out.width() / max(1, size)
+    width = max(2.0, 3.0 * scale)
+    p.setPen(QPen(QGuiApplication.palette().color(QPalette.ColorRole.Highlight), width))
     p.setBrush(Qt.BrushStyle.NoBrush)
     half = width / 2
-    p.drawRect(QRectF(half, half, out.width() - width, out.height() - width))
+    r = max(0.0, radius * scale - half)
+    p.drawRoundedRect(QRectF(half, half, out.width() - width, out.height() - width), r, r)
     p.end()
     return out
 
@@ -399,27 +493,67 @@ def divider(text: str = "") -> QWidget:
     return row
 
 
+def plural(n: int, word: str, many: str | None = None) -> str:
+    """plural(1, "Photo") is "Photo", plural(3, "Photo") is "3 Photos" (`many`: where it is not word + s)."""
+    return word if n == 1 else f"{n} {many or word + 's'}"
+
+
+def selected_items(widget) -> list:
+    """The selected rows of a list or tree, top to bottom (rows hidden by a filter do not count)."""
+    if hasattr(widget, "topLevelItemCount"):
+        items = [widget.topLevelItem(i) for i in range(widget.topLevelItemCount())]
+    else:
+        items = [widget.item(i) for i in range(widget.count())]
+    return [i for i in items if i.isSelected() and not i.isHidden()]
+
+
+def select_rows(widget, rows: list[int], current: int | None = None) -> None:
+    """Select exactly these rows of a list, in one go, and make `current` the current row."""
+    model, sm = widget.model(), widget.selectionModel()
+    selection = QItemSelection()
+    for r in rows:
+        selection.select(model.index(r, 0), model.index(r, 0))
+    sm.select(selection, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+    if current is not None:
+        sm.setCurrentIndex(model.index(current, 0), QItemSelectionModel.SelectionFlag.NoUpdate)
+
+
 def add_copy_action(widget) -> None:
-    """Right-click (or ⌘C) copies the selected row of a list or tree."""
+    """Right-click (or ⌘C) copies the selected rows of a list or tree, one per line."""
     from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 
     action = QAction("Copy", widget)
     action.setShortcut(QKeySequence.StandardKey.Copy)
     action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
 
-    def copy() -> None:
-        item = widget.currentItem()
-        if item is None:
-            return
+    def text(item) -> str:
         if hasattr(item, "columnCount"):
-            text = "  ".join(item.text(c) for c in range(item.columnCount()) if item.text(c))
-        else:
-            text = item.text()
-        QGuiApplication.clipboard().setText(text.replace("\n", " — "))
+            return "  ".join(item.text(c) for c in range(item.columnCount()) if item.text(c))
+        return item.text().replace("\n", " — ")
+
+    def copy() -> None:
+        items = selected_items(widget)
+        if items:
+            QGuiApplication.clipboard().setText("\n".join(text(i) for i in items))
 
     action.triggered.connect(copy)
     widget.addAction(action)
     widget.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+
+
+def add_menu_action(widget, slot, separator: bool = False):
+    """One more item for the right-click menu of a list (after Copy). It runs once the menu has closed,
+    so it may rebuild the list."""
+    from PySide6.QtGui import QAction
+
+    if separator:
+        line = QAction(widget)
+        line.setSeparator(True)
+        widget.addAction(line)
+    action = QAction(widget)
+    action.triggered.connect(lambda: QTimer.singleShot(0, slot))
+    widget.addAction(action)
+    return action
 
 
 NOT_SELECTABLE = ("ClickableLabel", "ElidedLabel")      # a click there has its own meaning
@@ -542,10 +676,16 @@ def choose_folder(parent, title: str) -> str:
 
 STYLE = """
 QFrame#card { border: none; border-radius: 10px; background: palette(base); }
-QFrame#dropzone { border: 2px dashed palette(mid); border-radius: 14px; background: palette(base); }
+QFrame#dropzone { border: 2px solid transparent; border-radius: 14px; background: palette(base); }
+QFrame#dropzone[filled="true"] { background: transparent; }
 QFrame#dropzone[hover="true"] { border-color: palette(highlight); }
 QLabel#muted { color: palette(placeholder-text); font-size: 12pt; }
-QLabel#banner { background: #fff3cd; color: #6b4e00; border-radius: 8px; padding: 8px 10px; }
+QLabel#subtitle { font-size: 15pt; }
+QLabel#tags { font-size: 13pt; }
+QLabel#banner { background: rgba(255, 170, 0, 40); color: palette(text); border-radius: 8px; padding: 8px 10px; }
+QProgressBar#score { border: none; border-radius: 2px; background: rgba(127, 127, 127, 50); }
+QProgressBar#score::chunk { border-radius: 2px; background: palette(highlight); }
+QWidget#sidebar { background: rgba(127, 127, 127, 22); }
 QListWidget, QTreeWidget { border: none; background: transparent; outline: 0; }
 QListWidget::item, QTreeWidget::item { border: none; padding: 3px 4px; }
 QListWidget::item:selected, QTreeWidget::item:selected { background: palette(highlight);
@@ -555,13 +695,14 @@ QListWidget::item:selected:!active, QTreeWidget::item:selected:!active { backgro
 QTreeWidget::item:selected { border-radius: 0px; }
 QTreeWidget::item:selected:first { border-top-left-radius: 7px; border-bottom-left-radius: 7px; }
 QTreeWidget::item:selected:last { border-top-right-radius: 7px; border-bottom-right-radius: 7px; }
+QTreeWidget { font-size: 14pt; }
 QTreeWidget QHeaderView::section { background: transparent; border: none; border-bottom: 1px solid palette(midlight);
-                                    padding: 4px 4px; color: palette(placeholder-text); }
+                                    padding: 4px 4px; color: palette(text); font-size: 13pt; }
 QListWidget#nav { font-size: 14px; }
-QListWidget#nav::item { padding: 7px 10px; margin: 1px 6px; }
+QListWidget#nav::item { padding: 7px 8px; margin: 1px 6px; }
+QListWidget#nav::item:selected, QListWidget#nav::item:selected:!active { background: rgba(127, 127, 127, 55);
+                                                                       color: palette(text); }
 QSplitter::handle { background: transparent; image: none; }
-QStatusBar { background: transparent; border: none; }
-QStatusBar::item { border: none; }
 QToolButton#icon { border: none; background: transparent; border-radius: 6px; }
 QToolButton#icon:pressed, QToolButton#icon:checked { background: rgba(127, 127, 127, 60); }
 QPushButton#primary { font-weight: 600; }

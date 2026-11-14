@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
-from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
-                               QPlainTextEdit, QProgressBar, QProgressDialog, QStackedWidget, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QMainWindow, QPlainTextEdit, QProgressBar, QProgressDialog, QStackedWidget,
+                               QVBoxLayout, QWidget)
 
 from .. import config
-from .common import GAP, PAGE_MARGIN, Runner, default_error_handler, header_row, icon_button, make_labels_selectable
+from .common import (GAP, PAGE_MARGIN, Runner, default_error_handler, header_row, icon_button, line_icon,
+                     make_labels_selectable)
 from .history_page import HistoryPage
 from .library_page import LibraryPage
 from .lock_screen import LockScreen
@@ -74,12 +75,25 @@ class MainWindow(QMainWindow):
 
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        self.nav.addItems(PAGES)
-        self.nav.setFixedWidth(170)
+        for page, icon in zip(PAGES, ("search", "history", "library", "trash")):
+            self.nav.addItem(QListWidgetItem(line_icon(icon), page))
+        self.nav.setIconSize(QSize(18, 18))
+        self.nav.setFixedWidth(180)
         self.page_stack = QStackedWidget()
         for p in self.pages.values():
             self.page_stack.addWidget(p)
         self.nav.currentRowChanged.connect(self._switch_page)
+
+        # no status bar: the rare messages (index being prepared, unreadable files) sit above the tools
+        self.stats = QLabel()
+        self.stats.setObjectName("muted")
+        self.stats.setWordWrap(True)
+        self.busy = QProgressBar()
+        self.busy.setObjectName("score")                         # thin, like the similarity meters
+        self.busy.setTextVisible(False)
+        self.busy.setFixedHeight(4)
+        self.busy.setVisible(False)
+        self.runner.busy_changed.connect(self._busy)
 
         settings_btn = icon_button("settings", "Settings")
         settings_btn.clicked.connect(self.open_settings)
@@ -90,11 +104,15 @@ class MainWindow(QMainWindow):
         tools.addWidget(lock_btn)
         tools.addStretch(1)
         side = QWidget()
+        side.setObjectName("sidebar")
+        side.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         sl = QVBoxLayout(side)
         sl.setContentsMargins(8, PAGE_MARGIN, 8, PAGE_MARGIN)          # headers line up with the pages
         sl.setSpacing(GAP)
-        sl.addWidget(header_row("FaceDictionary", size=15))     # same height as every page header
+        sl.addWidget(header_row(""))                             # the pages start below a header like this
         sl.addWidget(self.nav, 1)
+        sl.addWidget(self.stats)
+        sl.addWidget(self.busy)
         sl.addLayout(tools)
         workspace = QWidget()
         wl = QHBoxLayout(workspace)
@@ -107,14 +125,6 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.lock_screen)
         self.stack.addWidget(workspace)
         self.setCentralWidget(self.stack)
-
-        self.stats = QLabel()
-        self.busy = QProgressBar()
-        self.busy.setFixedWidth(160)
-        self.busy.setVisible(False)
-        self.statusBar().addWidget(self.stats, 1)
-        self.statusBar().addPermanentWidget(self.busy)
-        self.runner.busy_changed.connect(self._busy)
 
         # page signals
         self.search.open_entry.connect(self.open_entry)

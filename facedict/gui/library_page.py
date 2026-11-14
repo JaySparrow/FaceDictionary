@@ -9,29 +9,33 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence, QPainter,
-                           QPalette, QPen, QTextCursor, QUndoStack)
+                           QPalette, QPen, QPixmap, QTextCursor, QUndoStack)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QListWidget,
                                QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog,
                                QScrollArea, QSplitter, QToolTip, QVBoxLayout, QWidget)
 
+from .. import config
 from ..engine import iou, reading_order
 from ..imageio import is_supported
 from ..models import Entry, Face, OwnField, fold, split_values
 from ..service import SCOPE_ALL, SCOPE_NAME, SCOPE_TAGS, haystacks
 from . import undo
-from .common import (GAP, GUTTER, PAGE_MARGIN, ElidedLabel, add_copy_action, bytes_to_pixmap, choose_folder,
-                     confirm, default_error_handler, divider, has_focus_in, header_row, semibold, icon_button, make_selectable, mark_cover, mark_excluded, muted, open_images,
-                     placeholder_pixmap)
+from .common import (GAP, GUTTER, PAGE_MARGIN, ElidedLabel, TwoLineDelegate, add_copy_action, add_menu_action,
+                     bytes_to_pixmap, choose_folder, confirm, default_error_handler, divider, has_focus_in, header_row,
+                     icon_button, make_selectable, mark_cover, mark_excluded, muted, open_images, placeholder_pixmap,
+                     plural, rounded, select_rows, selected_items, semibold)
 from .faces_view import QueryView, render_photo
 from .history_page import fmt_time
 
 ROLE_ID = Qt.ItemDataRole.UserRole
 ROLE_SEARCH = Qt.ItemDataRole.UserRole + 1
 ROLE_COVER = Qt.ItemDataRole.UserRole + 2
-PHOTO_ICON = 116
+PHOTO_ICON = 168                  # the album's photos aim at this size and grow or shrink to fill the width
+PHOTO_GAP = 12
+PHOTO_RADIUS = 8
 LABEL_WIDTH = 110
 UNDO_LIMIT = 100
 
@@ -124,7 +128,6 @@ class InlineText(QWidget):
         self.on_menu = None                        # on_menu(True/False) while its right-click menu is open
         self.editing = False
         self.by_key = False                # the last edit ended with Enter or Tab (not a click)
-        self._dim = False
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
         self.label = label if label is not None else QLabel()
@@ -161,10 +164,6 @@ class InlineText(QWidget):
         if not self.editing:
             self._show()
 
-    def set_dim(self, dim: bool) -> None:
-        self._dim = dim
-        self._show()
-
     @property
     def empty(self) -> bool:
         return not self.text.strip()
@@ -172,7 +171,7 @@ class InlineText(QWidget):
     def _show(self) -> None:
         shown = self.display(self.text) if self.display and not self.empty else self.text
         self.label.setText(self.placeholder if self.empty else shown)
-        self._set_flag("empty", self.empty or self._dim)
+        self._set_flag("empty", self.empty)
 
     def _set_flag(self, name: str, on: bool) -> None:
         if bool(self.label.property(name)) != on:
@@ -306,8 +305,9 @@ class FieldRow(QWidget):
         self.marked = False
         self.name = InlineText(name, placeholder="Field name", hint="Field name")
         self.name.setFixedWidth(LABEL_WIDTH)
-        self.value = InlineText(value, multiline=True, placeholder="—")
-        self.name.set_dim(True)                               # field names are grey, like Contacts
+        value_font = QFont(self.font())
+        value_font.setPointSize(14)
+        self.value = InlineText(value, multiline=True, placeholder="—", font=value_font)
         self.name.on_menu = self.value.on_menu = self.set_marked
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -349,10 +349,50 @@ def dropped_images(mime) -> list:
     return []
 
 
+class FitScrollArea(QScrollArea):
+    """As tall as what it holds, up to half the window, then it scrolls. It follows its content: rows
+    added or removed, text that wraps differently at another width, a text box that grows."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.fit)
+
+    def setWidget(self, widget: QWidget) -> None:
+        super().setWidget(widget)
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.Type.LayoutRequest, QEvent.Type.Resize):
+            self.fit_later()
+        return False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event.oldSize().width() != event.size().width():
+            self.fit_later()
+
+    def fit_later(self) -> None:
+        self._timer.start(0)
+
+    def fit(self) -> None:
+        widget = self.widget()
+        if widget is None or widget.layout() is None:
+            return
+        layout = widget.layout()
+        width = max(200, self.viewport().width())
+        needed = layout.totalHeightForWidth(width) if layout.hasHeightForWidth() else layout.totalSizeHint().height()
+        height = min(needed + 2 * self.frameWidth(), max(120, self.window().height() // 2))
+        if self.maximumHeight() != height or self.minimumHeight() != height:
+            self.setFixedHeight(height)
+
+
 class PhotoGrid(QListWidget):
     """The album grid. Photos always snap to the grid and pack to the left; dragging one either
-    inserts it between two photos or swaps it with the photo it is dropped on. The first photo, the
-    cover, has a frame. Photos dragged in from outside are added."""
+    inserts it between two photos or swaps it with the photo it is dropped on (several selected photos
+    move together and are only inserted). The first photo, the cover, has a frame. Photos dragged in
+    from outside are added."""
 
     reordered = Signal(list)                       # photo ids in the new order
     dropped = Signal(list)                         # photos dragged in from outside: Path or bytes
@@ -363,14 +403,32 @@ class PhotoGrid(QListWidget):
         self.setViewMode(QListView.ViewMode.IconMode)
         self.setMovement(QListView.Movement.Static)          # items snap back into the grid
         self.setResizeMode(QListView.ResizeMode.Adjust)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setDropIndicatorShown(False)                    # we draw our own
-        self._drag_row = -1
+        self._drag_rows: list[int] = []                      # the photos being dragged
         self._drop: tuple[str, int] | None = None
         self._outside = False                      # the drag comes from outside the app
         self.setDragEnabled(True)
         self.viewport().setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+    def sizeHint(self) -> QSize:
+        return QSize(400, 200)                          # small: the album takes whatever room is left
+
+    def _fit(self) -> None:
+        """As many columns as photos of about PHOTO_ICON fit, then make them exactly fill the width."""
+        width = max(1, self.viewport().width() - 2)
+        columns = max(1, round((width + PHOTO_GAP) / (PHOTO_ICON + PHOTO_GAP)))
+        side = max(96, min(260, (width - columns * PHOTO_GAP) // columns))
+        if self.iconSize().width() != side:
+            self.setIconSize(QSize(side, side))
+            self.setGridSize(QSize(side + PHOTO_GAP, side + PHOTO_GAP))
 
     def ids(self) -> list[str]:
         return [self.item(i).data(ROLE_ID) for i in range(self.count())]
@@ -380,14 +438,14 @@ class PhotoGrid(QListWidget):
 
     # --- what a drop at this point would do -------------------------------------------------
 
-    def target_at(self, pos) -> tuple[str, int]:
+    def target_at(self, pos, swap: bool = True) -> tuple[str, int]:
         index = self.indexAt(pos)
         if index.isValid():
             rect = self.visualRect(index)
             frac = (pos.x() - rect.left()) / max(1, rect.width())
-            if 0.3 <= frac <= 0.7:
+            if swap and 0.3 <= frac <= 0.7:
                 return "swap", index.row()
-            return "insert", index.row() + (0 if frac < 0.3 else 1)
+            return "insert", index.row() + (0 if frac < (0.3 if swap else 0.5) else 1)
         for i in range(self.count()):
             rect = self._rect(i)
             if pos.y() < rect.top():
@@ -397,30 +455,31 @@ class PhotoGrid(QListWidget):
         return "insert", self.count()
 
     @staticmethod
-    def new_order(ids: list[str], source: int, kind: str, target: int) -> list[str]:
-        ids = list(ids)
-        if kind == "swap":
-            if target != source:
-                ids[source], ids[target] = ids[target], ids[source]
+    def new_order(ids: list[str], sources: list[int], kind: str, target: int) -> list[str]:
+        """The order after dropping the photos at rows `sources`: they swap with the photo at `target`
+        (one photo only) or go in, as a block in their own order, before the photo at `target`."""
+        ids, rows = list(ids), sorted(sources)
+        if kind == "swap" and len(rows) == 1:
+            ids[rows[0]], ids[target] = ids[target], ids[rows[0]]
             return ids
-        moved = ids.pop(source)
-        ids.insert(target - 1 if target > source else target, moved)
-        return ids
+        rest = [pid for i, pid in enumerate(ids) if i not in rows]
+        at = target - sum(r < target for r in rows)
+        return rest[:at] + [ids[r] for r in rows] + rest[at:]
 
     # --- drag and drop ------------------------------------------------------------------------
 
     def startDrag(self, actions):
-        self._drag_row = self.currentRow()
+        self._drag_rows = sorted(i.row() for i in self.selectedIndexes()) or [self.currentRow()]
         try:
             super().startDrag(actions)
         finally:
-            self._drag_row = -1
+            self._drag_rows = []
             self._drop = None
             self.viewport().update()
 
     def dragEnterEvent(self, event):
-        self._outside = self._drag_row < 0 and bool(dropped_images(event.mimeData()))
-        if self._drag_row >= 0:
+        self._outside = not self._drag_rows and bool(dropped_images(event.mimeData()))
+        if self._drag_rows:
             event.acceptProposedAction()
         elif self._outside:
             event.setDropAction(Qt.DropAction.CopyAction)
@@ -432,9 +491,9 @@ class PhotoGrid(QListWidget):
         if self._outside:
             event.setDropAction(Qt.DropAction.CopyAction)
             return event.accept()
-        if self._drag_row < 0:
+        if not self._drag_rows:
             return event.ignore()
-        self._drop = self.target_at(event.position().toPoint())
+        self._drop = self.target_at(event.position().toPoint(), swap=len(self._drag_rows) == 1)
         event.setDropAction(Qt.DropAction.MoveAction)
         event.accept()
         self.viewport().update()
@@ -453,12 +512,12 @@ class PhotoGrid(QListWidget):
             if items:
                 QTimer.singleShot(0, lambda: self.dropped.emit(items))
             return
-        drop, source = self._drop, self._drag_row
+        drop, sources = self._drop, self._drag_rows
         self._drop = None
         self.viewport().update()
-        if drop is None or source < 0:
+        if drop is None or not sources:
             return event.ignore()
-        order = self.new_order(self.ids(), source, *drop)
+        order = self.new_order(self.ids(), sources, *drop)
         event.setDropAction(Qt.DropAction.IgnoreAction)      # the page rebuilds the grid itself
         event.accept()
         if order != self.ids():
@@ -506,7 +565,8 @@ class PhotoDialog(QDialog):
         self.ref = photo_ref
         self.faces = [faces[i] for i in reading_order(faces)]
         self.setWindowTitle("Photo")
-        self.resize(820, 700)
+        screen = (parent.screen() if parent is not None else QApplication.primaryScreen()).availableGeometry()
+        self.resize(int(screen.width() * 0.72), int(screen.height() * 0.85))
 
         current = -1
         if photo_ref.face is not None and self.faces:
@@ -596,6 +656,10 @@ class LibraryPage(QWidget):
         lay.addWidget(split)
         self._show_entry(False)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.body_scroll.fit_later()                        # its limit is half the window
+
     def _action(self, text: str, shortcut: str, slot) -> QAction:
         action = QAction(text, self)
         action.setShortcut(QKeySequence(shortcut))
@@ -603,11 +667,11 @@ class LibraryPage(QWidget):
         return action
 
     def delete_target(self, focus):
-        """What ⌫ deletes: the selected photo in the album, or the selected entry in the list.
+        """What ⌫ deletes: the selected photos in the album, or the selected entries in the list.
         Fields have no selection, so they are not deleted by key (clear the name instead)."""
-        if has_focus_in(self.photos, focus) and self._current_photo() is not None:
+        if has_focus_in(self.photos, focus) and self._selected_photos():
             return self.remove_photo
-        if has_focus_in(self.list, focus) and self.entry is not None:
+        if has_focus_in(self.list, focus) and self._targets():
             return self.delete_entry
         return None
 
@@ -623,22 +687,26 @@ class LibraryPage(QWidget):
     def _build_list(self) -> QWidget:
         self.scope = QComboBox()
         self.scope.setToolTip("Where to search")
-        self.scope.currentIndexChanged.connect(self._apply_filter)
+        self.scope.currentIndexChanged.connect(self._filter_changed)
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Search the library")
         self.filter.setClearButtonEnabled(True)
-        self.filter.textChanged.connect(self._apply_filter)
+        self.filter.textChanged.connect(self._filter_changed)
         search_row = QHBoxLayout()
         search_row.setSpacing(4)
         search_row.addWidget(self.scope)
         search_row.addWidget(self.filter, 1)
 
         self.list = QListWidget()
-        self.list.setIconSize(QSize(40, 40))
+        self.list.setIconSize(QSize(44, 44))
+        self.list.setItemDelegate(TwoLineDelegate(44, round_picture=True, parent=self.list))
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
-        self.list.currentItemChanged.connect(self._entry_selected)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list.itemSelectionChanged.connect(self._selection_changed)
         add_copy_action(self.list)
+        self.export_action = add_menu_action(self.list, self.export_entry, separator=True)
+        self.trash_action = add_menu_action(self.list, self.delete_entry)
         self.count = muted()
         new_btn = icon_button("plus", "New entry (⌘N)")
         new_btn.clicked.connect(self.new_entry)
@@ -658,14 +726,18 @@ class LibraryPage(QWidget):
     # --- right: one entry --------------------------------------------------------------------------
 
     def _build_entry(self) -> QWidget:
-        title_font = semibold(self.font(), 22)
+        title_font = semibold(self.font(), 28)
         self.title = self._track(InlineText(font=title_font, wrap=False))
         self.title.validate = lambda text: None if text.strip() else "The entry needs a name."
         self.title.committed.connect(self._name_committed)
-        self.aliases_text = self._track(InlineText(placeholder="Aliases", label=ElidedLabel(),
+        aliases = ElidedLabel()
+        aliases.setObjectName("subtitle")
+        self.aliases_text = self._track(InlineText(placeholder="Aliases", label=aliases,
                                                    display=lambda t: "·  " + dotted(t)))
         self.aliases_text.committed.connect(lambda text: self._list_committed("aliases", "Aliases", text))
-        self.tags_text = self._track(InlineText(placeholder="Tags", label=muted(), display=dotted))
+        tags = QLabel()
+        tags.setObjectName("tags")
+        self.tags_text = self._track(InlineText(placeholder="Tags", label=tags, display=dotted))
         self.tags_text.committed.connect(lambda text: self._list_committed("tags", "Tags", text))
 
         self.export_btn = icon_button("export", "Export an unencrypted copy…")
@@ -684,7 +756,7 @@ class LibraryPage(QWidget):
         self.body_holder.setLayout(self.body)
         self.body_holder.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.body_holder.customContextMenuRequested.connect(self._body_menu)
-        self.body_scroll = QScrollArea()
+        self.body_scroll = FitScrollArea()
         self.body_scroll.setWidgetResizable(True)
         self.body_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -706,11 +778,9 @@ class LibraryPage(QWidget):
             photos_header.addWidget(b)
 
         self.photos = PhotoGrid()
-        self.photos.setIconSize(QSize(PHOTO_ICON, PHOTO_ICON))
-        self.photos.setGridSize(QSize(PHOTO_ICON + 16, PHOTO_ICON + 16))
-        self.photos.setMinimumHeight(PHOTO_ICON + 50)
+        self.photos.setMinimumHeight(140)
         self.photos.itemDoubleClicked.connect(lambda _i: self.open_photo())
-        self.photos.currentItemChanged.connect(lambda *_: self._update_photo_buttons())
+        self.photos.itemSelectionChanged.connect(self._update_photo_buttons)
         self.photos.reordered.connect(self._photos_reordered)
         self.photos.dropped.connect(lambda items: self.add_photo_files(self.entry.id, items) if self.entry else None)
 
@@ -722,9 +792,9 @@ class LibraryPage(QWidget):
         el.setSpacing(GAP)
         el.addWidget(header)
         el.addWidget(self.tags_text)
-        el.addWidget(self.body_scroll, 4)
+        el.addWidget(self.body_scroll)                  # as tall as its fields; the album takes the rest
         el.addLayout(photos_header)
-        el.addWidget(self.photos, 4)
+        el.addWidget(self.photos, 1)
         el.addWidget(self.stamps)
 
         self.placeholder = muted()
@@ -761,10 +831,14 @@ class LibraryPage(QWidget):
 
     # --- list handling -------------------------------------------------------------------------------
 
-    def refresh(self, select_id: str | None = None) -> None:
+    def refresh(self, select: str | list[str] | None = None) -> None:
+        """Show the library as it is now, with these entries selected (None: the ones selected now)."""
         if not self.service.unlocked:
             return
-        current = select_id or (self.entry.id if self.entry else None)
+        if select:
+            keep = [select] if isinstance(select, str) else list(select)
+        else:
+            keep = [i.data(ROLE_ID) for i in self.list.selectedItems()] or ([self.entry.id] if self.entry else [])
         entries = self.service.list_entries()
         field_ids = [f.id for f in self.service.global_fields()]
         self._fill_scopes()
@@ -782,12 +856,16 @@ class LibraryPage(QWidget):
             item.setData(ROLE_ID, e.id)
             item.setData(ROLE_SEARCH, haystacks(e, field_ids))
             self.list.addItem(item)
-            if e.id == current:
-                self.list.setCurrentItem(item)
+        rows = [i for i, e in enumerate(entries) if e.id in keep]
+        select_rows(self.list, rows, next((r for r in rows if entries[r].id == keep[0]), rows[0]) if rows else None)
         self.list.blockSignals(False)
         self.count.setText(f"{len(entries)} entries · {sum(len(e.photos) for e in entries)} photos")
         self._apply_filter()
-        self._load_entry(current if current and any(e.id == current for e in entries) else None)
+        shown = self._selected_ids()
+        if len(shown) > 1:
+            self._show_several(len(shown))
+        else:                                         # one entry stays shown while the filter hides it
+            self._load_entry(shown[0] if shown else keep[0] if len(keep) == 1 else None)
 
     @staticmethod
     def _list_text(e: Entry) -> str:
@@ -816,6 +894,11 @@ class LibraryPage(QWidget):
         self.scope.setCurrentIndex(index if index >= 0 else 0)
         self.scope.blockSignals(False)
 
+    def _filter_changed(self) -> None:
+        self._apply_filter()
+        if len(self.list.selectedItems()) > 1:
+            self._selection_changed()               # only the entries the filter shows count as selected
+
     def _apply_filter(self) -> None:
         needle = fold(self.filter.text())
         scope = self.scope.currentData() or SCOPE_ALL
@@ -828,11 +911,34 @@ class LibraryPage(QWidget):
         self.filter.clear()
         for i in range(self.list.count()):
             if self.list.item(i).data(ROLE_ID) == entry_id:
-                self.list.setCurrentRow(i)
+                self.list.setCurrentRow(i, QItemSelectionModel.SelectionFlag.ClearAndSelect)
                 return
 
-    def _entry_selected(self, item: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        self._load_entry(item.data(ROLE_ID) if item else None)
+    def _selected_ids(self) -> list[str]:
+        return [i.data(ROLE_ID) for i in selected_items(self.list)]
+
+    def _targets(self) -> list[str]:
+        """The entries a delete or an export is for: those selected, or the one shown."""
+        return self._selected_ids() or ([self.entry.id] if self.entry else [])
+
+    def _selection_changed(self) -> None:
+        ids = self._selected_ids()
+        if len(ids) > 1:
+            self._show_several(len(ids))
+        else:
+            self._load_entry(ids[0] if ids else None)
+
+    def _show_several(self, n: int) -> None:
+        self._load_entry(None)
+        self.placeholder.setText(f"{n} entries selected")
+
+    def _update_menu(self) -> None:
+        n = len(self._targets())
+        what = plural(n, "Entry", "Entries")
+        self.export_action.setText(f"Export {what}…")
+        self.trash_action.setText(f"Move {what} to Trash")
+        for action in (self.export_action, self.trash_action):
+            action.setEnabled(n > 0)
 
     # --- showing one entry ------------------------------------------------------------------------------
 
@@ -846,6 +952,8 @@ class LibraryPage(QWidget):
         ok = entry_id and self.service.unlocked and self.service.has_entry(entry_id)
         self.entry = self.service.get_entry(entry_id) if ok else None
         self._show_entry(self.entry is not None)
+        self.placeholder.setText("")
+        self._update_menu()
         if self.entry is None:
             self.photos.clear()
             self._body_key = None
@@ -883,6 +991,7 @@ class LibraryPage(QWidget):
         for own in e.own:
             self._add_row(("own", own.name), own.name, own.value, personal=True)
         self._body_key = self._fields_key()
+        self.body_scroll.fit_later()                        # its height follows the fields
         if scroll:
             QTimer.singleShot(0, lambda: self.body_scroll.verticalScrollBar().setValue(scroll))
 
@@ -931,8 +1040,8 @@ class LibraryPage(QWidget):
             self._light = False
         return not self._push_failed
 
-    def _step_done(self, entry_id: str | None) -> None:
-        if self._light and entry_id and self.entry is not None and entry_id == self.entry.id:
+    def _step_done(self, entry_id: str | list[str] | None) -> None:
+        if self._light and isinstance(entry_id, str) and self.entry is not None and entry_id == self.entry.id:
             self.entry = self.service.get_entry(entry_id)
             self._update_header()
             self._update_list_item(self.entry)
@@ -1107,22 +1216,29 @@ class LibraryPage(QWidget):
     # --- photos ---------------------------------------------------------------------------------------------
 
     def _load_photos(self) -> None:
-        item = self.photos.currentItem()
-        keep = item.data(ROLE_ID) if item else None        # keep the photo selected across a refresh
+        keep = {i.data(ROLE_ID) for i in self.photos.selectedItems()}     # kept selected across a refresh
+        current = self.photos.currentItem().data(ROLE_ID) if self.photos.currentItem() else None
         self.photos.blockSignals(True)
         self.photos.clear()
         e = self.entry
+        small = []                                         # thumbnails made smaller by an older version
         for i, ref in enumerate(e.photos):
             excluded = ref.face is None
             item = QListWidgetItem()
             try:
                 pm = bytes_to_pixmap(self.service.thumb_bytes(ref.photo_id, ref.face))
             except Exception:
+                pm = QPixmap()
+            if pm.isNull():
                 pm = placeholder_pixmap(PHOTO_ICON)
+            elif pm.width() < config.THUMB_SIZE:
+                small.append(ref.photo_id)
+            size = pm.width()                              # draw marks in the thumbnail's own pixels
             if excluded:
                 pm = mark_excluded(pm, PHOTO_ICON)
+            pm = rounded(pm, round(PHOTO_RADIUS * size / PHOTO_ICON))
             if i == 0:
-                pm = mark_cover(pm, PHOTO_ICON)
+                pm = mark_cover(pm, PHOTO_ICON, PHOTO_RADIUS)
             item.setIcon(QIcon(pm))
             item.setData(ROLE_ID, ref.photo_id)
             item.setData(ROLE_COVER, i == 0)
@@ -1137,11 +1253,25 @@ class LibraryPage(QWidget):
                 tip += f"\n{ref.face_count} faces found."
             item.setToolTip(tip)
             self.photos.addItem(item)
-            if ref.photo_id == keep:
-                self.photos.setCurrentItem(item)
+        rows = [i for i, ref in enumerate(e.photos) if ref.photo_id in keep]
+        select_rows(self.photos, rows, next((r for r in rows if e.photos[r].photo_id == current),
+                                            rows[0]) if rows else None)
         self.photos.blockSignals(False)
         self.photos_title.setText(f"Photos ({len(e.photos)})")
         self._update_photo_buttons()
+        if small:
+            self._sharpen_thumbs(e.id, small)
+
+    def _sharpen_thumbs(self, entry_id: str, small: list[str]) -> None:
+        """Make the small thumbnails again at today's size, in the background, then show them."""
+        if self.runner.busy:
+            return
+
+        def done(n):
+            if n and self.entry is not None and self.entry.id == entry_id:
+                self._load_photos()
+
+        self.runner.submit(lambda: self.service.remake_thumbs(entry_id, small), on_done=done)
 
     def _photos_reordered(self, order: list) -> None:
         """A drag in the album: saved at once (⌘Z puts the old order back)."""
@@ -1154,14 +1284,21 @@ class LibraryPage(QWidget):
         self._push(undo.ReorderPhotos(self.service, self.entry.id, old, list(order), **self._callbacks()))
 
     def _update_photo_buttons(self) -> None:
-        ref = self._current_photo()
-        self.remove_photo_btn.setEnabled(ref is not None)
-        self.exclude_btn.setEnabled(ref is not None and not (ref.face is None and ref.face_count == 0))
-        self.exclude_btn.setChecked(ref is not None and ref.face is None)
-        if ref is not None and ref.face is None:
-            self.exclude_btn.setToolTip("Use this photo for matching again")
-        else:
-            self.exclude_btn.setToolTip("Do not use the selected photo for matching")
+        refs = self._selected_photos()
+        off = bool(refs) and all(r.face is None for r in refs)          # none of them is used for matching
+        self.remove_photo_btn.setEnabled(bool(refs))
+        self.exclude_btn.setEnabled(any(r.face_count > 0 for r in refs) if off else bool(refs))
+        self.exclude_btn.setChecked(off)
+        what = "the selected photos" if len(refs) > 1 else "the selected photo"
+        self.remove_photo_btn.setToolTip(f"Move {what} to the Trash")
+        self.exclude_btn.setToolTip(f"Use {what} for matching again" if off else f"Do not use {what} for matching")
+
+    def _selected_photos(self) -> list:
+        """The selected photos of the album, in album order."""
+        if self.entry is None:
+            return []
+        refs = [self.entry.photo(i.data(ROLE_ID)) for i in selected_items(self.photos)]
+        return [r for r in refs if r is not None]
 
     def _current_photo(self):
         item = self.photos.currentItem()
@@ -1237,53 +1374,64 @@ class LibraryPage(QWidget):
         def done(out):
             img, faces = out
             dlg = PhotoDialog(self.service, self.runner, entry_id, ref, img, faces, self)
-            dlg.face_changed.connect(lambda pid, old, new: self._face_changed(entry_id, pid, old, new))
+            dlg.face_changed.connect(lambda pid, old, new: self._faces_changed(entry_id, [(pid, old, new)]))
             dlg.save_note = lambda pid, old, new: self._push(
                 undo.SetPhotoNote(self.service, entry_id, pid, old, new, **self._callbacks()), light=True)
             dlg.exec()
 
         self.runner.submit(lambda: self.service.detect_faces(ref.photo_id), on_done=done)
 
-    def _face_changed(self, entry_id: str, photo_id: str, old: Face | None, new: Face | None) -> None:
-        self._push(undo.ChooseFace(self.service, entry_id, photo_id, old, new, **self._callbacks()))
+    def _faces_changed(self, entry_id: str, changes: list[tuple[str, Face | None, Face | None]]) -> None:
+        self._push(undo.ChooseFaces(self.service, entry_id, changes, **self._callbacks()))
         self.refresh(entry_id)
         self.changed.emit()
 
     def toggle_excluded(self) -> None:
-        """The 🚫 button: stop using this photo for matching, or start using it again."""
-        ref = self._current_photo()
-        if ref is None or self.entry is None:
+        """The 🚫 button: stop using the selected photos for matching or, when none of them is used,
+        start using them again (with their largest face)."""
+        refs = self._selected_photos()
+        if not refs or self.entry is None:
             self.exclude_btn.setChecked(False)
             return
         self.commit_edits()
-        entry_id, photo_id, before = self.entry.id, ref.photo_id, ref.face
+        entry_id = self.entry.id
+        include = all(r.face is None for r in refs)
+        todo = [(r.photo_id, r.face) for r in refs if (r.face_count > 0 if include else r.face is not None)]
 
         def work():
-            if before is not None:
-                return self.service.choose_face(entry_id, photo_id, None)
-            _img, faces = self.service.detect_faces(photo_id)
-            if not faces:
-                return None
-            return self.service.choose_face(entry_id, photo_id, faces[0])       # the largest face
+            changes = []
+            for photo_id, before in todo:
+                if include:
+                    _img, faces = self.service.detect_faces(photo_id)
+                    if not faces:
+                        continue
+                    ref = self.service.choose_face(entry_id, photo_id, faces[0])       # the largest face
+                else:
+                    ref = self.service.choose_face(entry_id, photo_id, None)
+                changes.append((photo_id, before, ref.face))
+            return changes
 
-        def done(result):
-            if result is None:
-                QMessageBox.information(self, "Photo", "No face could be found in this photo, so it cannot be "
-                                                       "used for matching.")
+        def done(changes):
+            if not changes:
+                QMessageBox.information(self, "Photo", "No face could be found in this photo, so it cannot be used "
+                                        "for matching." if len(todo) <= 1 else "No face could be found in these "
+                                        "photos, so they cannot be used for matching.")
                 self.refresh(entry_id)
                 return
-            self._face_changed(entry_id, photo_id, before, result.face)
+            self._faces_changed(entry_id, changes)
 
         self.runner.submit(work, on_done=done)
 
     def remove_photo(self) -> None:
-        ref = self._current_photo()
-        if ref is None:
+        refs = self._selected_photos()
+        if not refs:
             return
-        if confirm(self, "Remove photo", "Move this photo to the Trash? You can restore it later.",
-                   "Move to Trash"):
+        text = ("Move this photo to the Trash? You can restore it later." if len(refs) == 1 else
+                f"Move these {len(refs)} photos to the Trash? You can restore them later.")
+        if confirm(self, "Remove photos" if len(refs) > 1 else "Remove photo", text, "Move to Trash"):
             self.commit_edits()
-            self._push(undo.RemovePhoto(self.service, self.entry.id, ref.photo_id, **self._callbacks()))
+            self._push(undo.RemovePhotos(self.service, self.entry.id, [r.photo_id for r in refs],
+                                         **self._callbacks()))
 
     # --- entry actions ------------------------------------------------------------------------------------
 
@@ -1298,27 +1446,38 @@ class LibraryPage(QWidget):
             self.changed.emit()
 
     def delete_entry(self) -> None:
-        if self.entry is None:
+        """Move the selected entries (or the one shown) to the Trash, as one step to undo."""
+        ids = self._targets()
+        if not ids:
             return
         self.commit_edits()
-        e = self.entry
-        if confirm(self, "Delete entry", f"Move “{e.name}” and its {len(e.photos)} photo(s) to the Trash?\n"
-                   "You can restore it from the Trash.", "Move to Trash", destructive=True):
-            self._push(undo.DeleteEntry(self.service, e.id, **self._callbacks()))
+        entries = [self.service.get_entry(eid) for eid in ids]
+        photos = sum(len(e.photos) for e in entries)
+        if len(entries) == 1:
+            title, text = "Delete entry", (f"Move “{entries[0].name}” and its {photos} photo(s) to the Trash?\n"
+                                           "You can restore it from the Trash.")
+        else:
+            title, text = "Delete entries", (f"Move these {len(entries)} entries and their {photos} photo(s) to "
+                                             "the Trash?\nYou can restore them from the Trash.")
+        if confirm(self, title, text, "Move to Trash", destructive=True):
+            self._push(undo.DeleteEntries(self.service, ids, **self._callbacks()))
 
     def export_entry(self) -> None:
-        if self.entry is None:
+        """Unencrypted copies of the selected entries (or the one shown), one folder each."""
+        ids = self._targets()
+        if not ids:
             return
         self.commit_edits()
-        if not confirm(self, "Export entry",
-                       "Export creates UNENCRYPTED copies of this entry's information and photos in a folder "
+        what = "this entry's" if len(ids) == 1 else f"these {len(ids)} entries'"
+        if not confirm(self, "Export entry" if len(ids) == 1 else "Export entries",
+                       f"Export creates UNENCRYPTED copies of {what} information and photos in a folder "
                        "you choose. Anyone with access to that folder can see them.\n\nContinue?",
                        "Choose folder…", destructive=True):
             return
         folder = choose_folder(self, "Export to folder")
         if folder:
-            out = self.service.export_entry(self.entry.id, Path(folder))
-            QMessageBox.information(self, "Export", f"Exported to:\n{out}")
+            outs = [self.service.export_entry(eid, Path(folder)) for eid in ids]
+            QMessageBox.information(self, "Export", f"Exported to:\n{outs[0] if len(outs) == 1 else folder}")
 
     def import_folder(self) -> None:
         self.commit_edits()

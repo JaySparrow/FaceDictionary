@@ -415,9 +415,12 @@ def test_history_page_switches_faces(ready, qtbot, group):
     ready.history.list.setCurrentRow(0)
     assert "(3 faces)" in ready.history.list.item(0).text()
     qtbot.waitUntil(lambda: ready.history.query.image.face_count == 3, timeout=10000)
+    icon = ready.history.list.item(0).icon().cacheKey()
     click_face(qtbot, ready.history.query.image, 1)
     assert ready.history.results.cards()[0].entry_id == expected[1]
     qtbot.waitUntil(lambda: ready.service.list_history()[0].selected == 1, timeout=5000)
+    qtbot.waitUntil(lambda: ready.history.list.item(0).icon().cacheKey() != icon, timeout=5000)
+    assert ready.service.get_entry(expected[1]).name in ready.history.list.item(0).text()   # its top match
 
 
 def dclick_face(qtbot, view, index):
@@ -435,7 +438,7 @@ def test_photo_dialog_double_click_picks_the_face_used_for_matching(ready, qtbot
     lib.select_entry(entry.id)
     img, faces = ready.service.detect_faces(res.photo.photo_id)
     dlg = PhotoDialog(ready.service, ready.runner, entry.id, res.photo, img, faces, ready)
-    dlg.face_changed.connect(lambda pid, old, new: lib._face_changed(entry.id, pid, old, new))
+    dlg.face_changed.connect(lambda pid, old, new: lib._faces_changed(entry.id, [(pid, old, new)]))
     qtbot.addWidget(dlg)
     dlg.show()
     qtbot.waitExposed(dlg)
@@ -655,10 +658,11 @@ def test_shared_and_own_fields_in_the_entry_page(ready, qtbot):
     assert met[0] == "field" and stored.fields[met[1]] == "the 2019 conference"
     assert [(f.name, f.value) for f in stored.own] == [("Phone", "555-11")] and phone == ("own", "Phone")
 
-    # the shared field is on every entry: shown dimmed while empty, a click fills it in
+    # the shared field is on every entry: its text is dimmed while empty (its name is not), a click fills it in
     other = open_entry(ready, 1)
     row = other._rows[met]
-    assert row.value.empty and row.value.label.text() == "—" and row.name.label.property("empty")
+    assert row.value.empty and row.value.label.text() == "—" and row.value.label.property("empty")
+    assert not row.name.label.property("empty")
     assert ("own", "Phone") not in other._rows
     qtbot.mouseClick(row.value.label, Qt.MouseButton.LeftButton)
     assert row.value.editing
@@ -894,6 +898,136 @@ def test_the_delete_key_deletes_what_is_selected_on_every_page(ready, qtbot, peo
     assert [a.text() for a in ready.menuBar().actions()[0].menu().actions()].count("Delete") == 1
 
 
+# --- several at once (⌘-click, ⇧-click) ---------------------------------------------------------------
+
+CMD = Qt.KeyboardModifier.ControlModifier            # Qt's name for ⌘ on a Mac
+SHIFT = Qt.KeyboardModifier.ShiftModifier
+
+
+def click_row(qtbot, view, row, modifier=Qt.KeyboardModifier.NoModifier):
+    rect = view.visualItemRect(view.item(row))
+    qtbot.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, modifier, rect.center())
+
+
+def test_several_entries_are_deleted_and_restored_as_one_step(ready, qtbot, monkeypatch):
+    asked, warnings = [], []
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: asked.append(a[2]) or True)
+    monkeypatch.setattr(library_page.QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
+    svc = ready.service
+    lib = open_entry(ready)
+    ids = [lib.list.item(i).data(library_page.ROLE_ID) for i in range(3)]
+    click_row(qtbot, lib.list, 0)
+    click_row(qtbot, lib.list, 2, SHIFT)                                   # a range
+    assert lib._selected_ids() == ids
+    assert lib.entry is None and lib.entry_widget.isHidden() and lib.placeholder.text() == "3 entries selected"
+    click_row(qtbot, lib.list, 1, CMD)                                     # one less
+    assert lib._selected_ids() == [ids[0], ids[2]] and lib.trash_action.text() == "Move 2 Entries to Trash"
+
+    lib.list.setFocus()
+    qtbot.keyClick(lib.list, Qt.Key.Key_Backspace)
+    assert len(asked) == 1 and "2 entries" in asked[0]
+    assert not svc.has_entry(ids[0]) and not svc.has_entry(ids[2]) and svc.has_entry(ids[1])
+    assert ready.undo_action.text() == "Undo Delete 2 Entries"
+    ready.undo_action.trigger()                                            # one ⌘Z brings both back
+    assert svc.has_entry(ids[0]) and svc.has_entry(ids[2]) and svc.list_trash() == []
+    assert lib._selected_ids() == [ids[0], ids[2]] and lib.placeholder.text() == "2 entries selected"
+
+    ready.redo_action.trigger()
+    svc.purge(svc.list_trash()[0].id)                                      # one of them is gone for good
+    ready.undo_action.trigger()
+    assert warnings and "no longer in the Trash" in warnings[0]
+    assert not svc.has_entry(ids[0]) and not svc.has_entry(ids[2])        # so neither comes back
+
+
+def test_several_entries_are_exported_at_once(ready, qtbot, tmp_path, monkeypatch):
+    out = tmp_path / "export"
+    out.mkdir()
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(library_page, "choose_folder", lambda *a, **k: str(out))
+    reports = []
+    monkeypatch.setattr(library_page.QMessageBox, "information", lambda *a, **k: reports.append(a[2]))
+    lib = open_entry(ready)
+    click_row(qtbot, lib.list, 0)
+    click_row(qtbot, lib.list, 1, CMD)
+    assert lib.export_action.text() == "Export 2 Entries…"
+    lib.export_action.trigger()                                            # from the right-click menu
+    qtbot.waitUntil(lambda: bool(reports), timeout=10000)
+    assert len([d for d in out.iterdir() if (d / "entry.json").exists()]) == 2
+    second = ready.service.get_entry(lib.list.item(1).data(library_page.ROLE_ID))
+    lib.filter.setText(second.name)                                        # what the filter hides is not selected
+    assert lib.entry is not None and lib.entry.id == second.id and lib.export_action.text() == "Export Entry…"
+    lib.filter.clear()
+    assert lib.entry is None and lib.placeholder.text() == "2 entries selected"
+
+
+def test_several_photos_are_switched_off_moved_and_removed_together(ready, qtbot, monkeypatch):
+    asked = []
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: asked.append(a[2]) or True)
+    svc = ready.service
+    lib = open_entry(ready)
+    grid, entry_id, ids = lib.photos, lib.entry.id, lib.photos.ids()
+    qtbot.waitUntil(lambda: grid.visualItemRect(grid.item(2)).width() > 0, timeout=5000)
+    click_row(qtbot, grid, 0)
+    click_row(qtbot, grid, 2, CMD)
+    chosen = [ids[0], ids[2]]
+
+    def faces():
+        return [svc.get_entry(entry_id).photo(pid).face for pid in chosen]
+
+    def selected():
+        return [i.data(library_page.ROLE_ID) for i in common.selected_items(grid)]
+
+    lib.exclude_btn.click()                                                # both stop being used
+    qtbot.waitUntil(lambda: faces() == [None, None], timeout=10000)
+    idle(ready, qtbot)
+    assert ready.undo_action.text() == "Undo Stop Using 2 Photos" and not any(p in svc.index for p in chosen)
+    assert selected() == chosen and lib.exclude_btn.isChecked()           # so the button turns them on again
+    lib.exclude_btn.click()
+    qtbot.waitUntil(lambda: None not in faces(), timeout=10000)
+    idle(ready, qtbot)
+    assert ready.undo_action.text() == "Undo Use 2 Photos" and all(p in svc.index for p in chosen)
+    ready.undo_action.trigger()
+    assert faces() == [None, None]
+    ready.undo_action.trigger()
+    assert None not in faces()
+
+    grid.setFocus()
+    qtbot.keyClick(grid, Qt.Key.Key_Backspace)                             # ⌫: both to the Trash, one question
+    assert len(asked) == 1 and "2 photos" in asked[0]
+    assert grid.ids() == [p for p in ids if p not in chosen]
+    ready.undo_action.trigger()
+    assert grid.ids() == ids                                               # back in their old places
+
+
+def test_several_search_records_are_copied_and_deleted_at_once(ready, qtbot, people, monkeypatch):
+    from PySide6.QtGui import QGuiApplication
+
+    from facedict.gui import history_page
+    asked = []
+    monkeypatch.setattr(history_page, "confirm", lambda *a, **k: asked.append(a[2]) or True)
+    for i in range(3):
+        run_search(ready, qtbot, held_out(people, i)[1])
+    ready.nav.setCurrentRow(1)
+    h = ready.history
+    qtbot.waitUntil(lambda: h.list.count() == 3, timeout=5000)
+    click_row(qtbot, h.list, 0)
+    click_row(qtbot, h.list, 1, CMD)
+    assert h.several.text() == "2 searches selected" and h.detail.isHidden() and h.delete_btn.isHidden()
+    assert h.trash_action.text() == "Move 2 Records to Trash"
+    QGuiApplication.clipboard().clear()
+    next(a for a in h.list.actions() if a.text() == "Copy").trigger()     # ⌘C: one line per row
+    rows = [h.list.item(i).text().replace("\n", " — ") for i in (0, 1)]
+    assert QGuiApplication.clipboard().text().splitlines() == rows
+
+    h.list.setFocus()
+    qtbot.keyClick(h.list, Qt.Key.Key_Backspace)
+    assert len(asked) == 1 and "2 search records" in asked[0]
+    assert len(ready.service.list_history()) == 1 and h.list.count() == 1
+    assert [i.kind for i in ready.service.list_trash()] == ["history", "history"]
+    click_row(qtbot, h.list, 0)
+    assert h.several.isHidden() and not h.detail.isHidden() and not h.delete_btn.isHidden()
+
+
 def test_esc_keeps_the_old_text_and_a_click_elsewhere_saves(ready, qtbot):
     lib = open_entry(ready)
     entry_id, name = lib.entry.id, lib.entry.name
@@ -917,11 +1051,17 @@ def test_esc_keeps_the_old_text_and_a_click_elsewhere_saves(ready, qtbot):
 def test_drag_maths_inserts_and_swaps():
     from facedict.gui.library_page import PhotoGrid
     ids = ["a", "b", "c", "d"]
-    assert PhotoGrid.new_order(ids, 3, "insert", 1) == ["a", "d", "b", "c"]      # move the last one forward
-    assert PhotoGrid.new_order(ids, 0, "insert", 3) == ["b", "c", "a", "d"]      # and one backwards
-    assert PhotoGrid.new_order(ids, 0, "insert", 4) == ["b", "c", "d", "a"]      # to the very end
-    assert PhotoGrid.new_order(ids, 0, "swap", 2) == ["c", "b", "a", "d"]        # swap two photos
-    assert PhotoGrid.new_order(ids, 1, "swap", 1) == ids
+    assert PhotoGrid.new_order(ids, [3], "insert", 1) == ["a", "d", "b", "c"]    # move the last one forward
+    assert PhotoGrid.new_order(ids, [0], "insert", 3) == ["b", "c", "a", "d"]    # and one backwards
+    assert PhotoGrid.new_order(ids, [0], "insert", 4) == ["b", "c", "d", "a"]    # to the very end
+    assert PhotoGrid.new_order(ids, [0], "swap", 2) == ["c", "b", "a", "d"]      # swap two photos
+    assert PhotoGrid.new_order(ids, [1], "swap", 1) == ids
+    # several photos move as a block, in their own order, and are only inserted
+    assert PhotoGrid.new_order(ids, [3, 1], "insert", 0) == ["b", "d", "a", "c"]
+    assert PhotoGrid.new_order(ids, [0, 2], "insert", 4) == ["b", "d", "a", "c"]
+    assert PhotoGrid.new_order(ids, [0, 3], "insert", 2) == ["b", "a", "d", "c"]
+    assert PhotoGrid.new_order(ids, [1, 2], "insert", 2) == ids                   # dropped onto themselves
+    assert PhotoGrid.new_order(ids, [0, 1], "swap", 3) == ["c", "a", "b", "d"]    # no swap: an insert
 
 
 def test_merged_order_keeps_photos_added_or_removed_since():
@@ -941,6 +1081,9 @@ def test_dropping_on_a_photo_swaps_between_photos_inserts(ready, qtbot):
     assert grid.target_at(rect.center()) == ("swap", 1)                          # middle of a photo
     assert grid.target_at(rect.topLeft() + QPoint(2, 10)) == ("insert", 1)       # its left edge
     assert grid.target_at(rect.topRight() + QPoint(-2, 10)) == ("insert", 2)     # its right edge
+    for frac, row in ((0.4, 1), (0.6, 2)):                                    # several photos are only inserted
+        assert grid.target_at(QPoint(rect.left() + round(rect.width() * frac), rect.center().y()), swap=False) == \
+            ("insert", row)
     far = QPoint(grid.viewport().width() - 4, rect.center().y())
     assert grid.target_at(far)[0] == "insert"
 
@@ -953,9 +1096,9 @@ def test_reordering_photos_is_saved_at_once_and_undone_with_cmd_z(ready, qtbot):
     assert all(lib.photos.item(i).text() == "" for i in range(lib.photos.count()))     # no captions
     assert lib.photos.item(0).data(library_page.ROLE_COVER) and not lib.photos.item(1).data(library_page.ROLE_COVER)
 
-    lib.photos.reordered.emit(PhotoGrid.new_order(ids, 2, "insert", 1))
+    lib.photos.reordered.emit(PhotoGrid.new_order(ids, [2], "insert", 1))
     assert [p.photo_id for p in ready.service.get_entry(entry_id).photos][:3] == [ids[0], ids[2], ids[1]]
-    lib.photos.reordered.emit(PhotoGrid.new_order(lib.photos.ids(), 0, "swap", len(ids) - 1))
+    lib.photos.reordered.emit(PhotoGrid.new_order(lib.photos.ids(), [0], "swap", len(ids) - 1))
     saved = [p.photo_id for p in ready.service.get_entry(entry_id).photos]
     assert saved[0] == ids[-1] and saved[-1] == ids[0]                          # a new cover, right away
     assert lib.photos.ids() == saved

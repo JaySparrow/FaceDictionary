@@ -269,6 +269,27 @@ def test_every_face_of_a_group_photo_is_searched(svc, group):
     assert [s.matches[0].entry_id for s in rec.searches] == expected
 
 
+def thumb_face(svc, rec) -> int:
+    """Which face of a search record its thumbnail shows."""
+    from facedict.engine import thumbnail
+    from facedict.imageio import decode
+    img = decode(svc._v().get_photo(rec.photo_id))
+    thumb = decode(svc.thumb_bytes(rec.photo_id)).astype(float)
+    return int(np.argmin([np.abs(thumbnail(img, s.face).astype(float) - thumb).mean() for s in rec.searches]))
+
+
+def test_history_thumbnail_follows_the_face_picked(svc, group):
+    data, _ = group
+    rec = svc.query(data).history
+    assert thumb_face(svc, rec) == 1                       # the largest face, shown first
+    svc.set_selected(rec.id, 3)
+    assert thumb_face(svc, svc.get_history(rec.id)) == 3
+    # a thumbnail left behind by an older version is made again
+    svc._store_thumb(rec.photo_id, svc.photo_image(rec.photo_id), rec.searches[1].face)
+    assert svc.remake_history_thumbs([rec.id]) == [rec.id]
+    assert thumb_face(svc, svc.get_history(rec.id)) == 3
+
+
 def test_confirm_and_undo_per_face(svc, group, monkeypatch):
     data, expected = group
     rec = svc.query(data).history

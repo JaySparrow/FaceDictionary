@@ -31,7 +31,7 @@ DETECT_MAX_SIDE_LARGE = 1280   # ... so big photos get a second, finer pass for 
 DETECT_SCORE_THRESHOLD = 0.8
 DETECT_RETRY_THRESHOLD = 0.5
 DISPLAY_CROP_MARGIN = 0.25
-THUMB_SIZE = 192
+THUMB_SIZE = 400                 # big enough for the album at full width on Retina screens
 TOP_K = 5
 
 

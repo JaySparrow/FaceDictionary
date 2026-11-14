@@ -32,7 +32,9 @@ app updates.
 
 Shortcuts: ⌘1–⌘4 switch pages · ⌘O open a photo · ⌘V paste · ⌘F find an entry · ⌘N new entry · ⌘L lock ·
 ⌘Z / ⇧⌘Z undo and redo any change in the Library, step after step (also in *Edit*) ·
-⌫ deletes what is selected in the list or album you are in, as its delete button does.
+⌫ deletes what is selected in the list or album you are in, as its delete button does ·
+⌘-click and ⇧-click select several entries, photos, searches or Trash items; ⌫, the right-click menu,
+the album's buttons and ⌘C then act on all of them at once (in the Library, one ⌘Z undoes it).
 
 **Fields.** A *shared* field exists on every entry of the database, each with its own text (an empty
 one is shown dimmed, ready to fill in); a field *only in this entry* stays where you made it, below a
@@ -103,7 +105,7 @@ conda env create -f environment.yml
 conda activate facedict
 python scripts/fetch_models.py      # ~53 MB, verified by SHA-256
 ./run.command                       # start the app
-python -m pytest                    # ~160 tests; temp databases only, GUI runs offscreen
+python -m pytest                    # ~170 tests; temp databases only, GUI runs offscreen
 ```
 
 Command line: `python -m facedict query PHOTO [--face N]`, `import FOLDER`, `evaluate`, `verify`;

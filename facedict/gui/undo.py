@@ -17,8 +17,9 @@ from PySide6.QtGui import QUndoCommand
 
 from ..models import Face, FieldDef, OwnField, new_id
 from ..service import RemovedField
+from .common import plural
 
-Done = Callable[[str | None], None]                 # show this entry after a step (None: no entry)
+Done = Callable[[str | list[str] | None], None]     # show this entry (or these) after a step (None: no entry)
 Failed = Callable[["LibraryCommand", Exception], None]
 
 
@@ -28,10 +29,6 @@ def merged_order(current: list[str], wanted: list[str]) -> list[str]:
     head = [pid for pid in wanted if pid in present]
     known = set(head)
     return head + [pid for pid in current if pid not in known]
-
-
-def plural(n: int, word: str) -> str:
-    return f"{n} {word}s" if n != 1 else word
 
 
 class LibraryCommand(QUndoCommand):
@@ -69,8 +66,8 @@ class LibraryCommand(QUndoCommand):
             return
         self._done(self.shown_entry())
 
-    def shown_entry(self) -> str | None:
-        """The entry to show after a step."""
+    def shown_entry(self) -> str | list[str] | None:
+        """The entry (or entries) to show after a step."""
         if self.entry_id and self.service.has_entry(self.entry_id):
             return self.entry_id
         return None
@@ -224,18 +221,21 @@ class _PhotoCommand(LibraryCommand):
         if order != current:
             self.service.set_photo_order(self.entry_id, order)
 
-    def _take(self, photo_id: str) -> str | None:
-        """Move a photo of this entry to the Trash; returns the trash item (None: it was gone already)."""
-        if self._entry().photo(photo_id) is None:
-            return None
-        return self.service.remove_photo(self.entry_id, photo_id).id
+    def _take(self, photo_ids: list[str]) -> dict[str, str | None]:
+        """Move photos of this entry to the Trash; returns their trash items (None: it was gone already)."""
+        entry = self._entry()
+        return {pid: self.service.remove_photo(self.entry_id, pid).id if entry.photo(pid) is not None else None
+                for pid in photo_ids}
 
-    def _give_back(self, photo_id: str, trash_id: str | None) -> None:
-        if self._entry().photo(photo_id) is not None:          # put back from the Trash page already
-            return
-        if trash_id is None or not self.service.in_trash(trash_id):
-            raise LookupError("the photo is no longer in the Trash")
-        self.service.restore(trash_id)
+    def _give_back(self, trash: dict[str, str | None]) -> None:
+        """Bring photos back from the Trash: all of them or, if any is gone from there, none."""
+        entry = self._entry()
+        missing = [pid for pid in trash if entry.photo(pid) is None]     # not put back from the Trash page
+        if any(trash[pid] is None or not self.service.in_trash(trash[pid]) for pid in missing):
+            raise LookupError("the photo is no longer in the Trash" if len(trash) == 1 else
+                              "some of the photos are no longer in the Trash")
+        for pid in missing:
+            self.service.restore(trash[pid])
 
 
 class AddPhotos(_PhotoCommand):
@@ -250,29 +250,28 @@ class AddPhotos(_PhotoCommand):
 
     def revert(self) -> None:
         self.order = self._ids()
-        self.trash = {pid: self._take(pid) for pid in self.photo_ids}
+        self.trash = self._take(self.photo_ids)
 
     def apply(self) -> None:
-        for pid in self.photo_ids:
-            self._give_back(pid, self.trash.get(pid))
+        self._give_back(self.trash)
         self._order(self.order)
 
 
-class RemovePhoto(_PhotoCommand):
-    """Moves a photo to the Trash; undo puts it back in its old place."""
+class RemovePhotos(_PhotoCommand):
+    """Moves photos to the Trash; undo puts them back in their old places."""
 
-    def __init__(self, service, entry_id, photo_id: str, **kw):
-        super().__init__(service, entry_id, "Remove Photo", **kw)
-        self.photo_id = photo_id
-        self.trash_id: str | None = None
+    def __init__(self, service, entry_id, photo_ids: list[str], **kw):
+        super().__init__(service, entry_id, f"Remove {plural(len(photo_ids), 'Photo')}", **kw)
+        self.photo_ids = list(photo_ids)
+        self.trash: dict[str, str | None] = {}
         self.order: list[str] = []
 
     def apply(self) -> None:
         self.order = self._ids()
-        self.trash_id = self._take(self.photo_id)
+        self.trash = self._take(self.photo_ids)
 
     def revert(self) -> None:
-        self._give_back(self.photo_id, self.trash_id)
+        self._give_back(self.trash)
         self._order(self.order)
 
 
@@ -288,20 +287,34 @@ class ReorderPhotos(_PhotoCommand):
         self._order(self.old)
 
 
-class ChooseFace(_PhotoCommand):
-    """Which face of a photo is used for matching (None: the photo is not used). Made by a background
-    task, because finding the face takes a moment."""
+class ChooseFaces(_PhotoCommand):
+    """Which face of each photo is used for matching (None: the photo is not used), as (photo id, old,
+    new) changes. Made by a background task, because finding faces takes a moment."""
 
-    def __init__(self, service, entry_id, photo_id: str, old: Face | None, new: Face | None, **kw):
-        text = "Stop Using Photo" if new is None else "Use Photo" if old is None else "Change Face"
+    def __init__(self, service, entry_id, changes: list[tuple[str, Face | None, Face | None]], **kw):
+        n = len(changes)
+        if all(new is None for _, _, new in changes):
+            text = f"Stop Using {plural(n, 'Photo')}"
+        elif all(old is None for _, old, _ in changes):
+            text = f"Use {plural(n, 'Photo')}"
+        else:
+            text = f"Change {plural(n, 'Face')}"
         super().__init__(service, entry_id, text, done_already=True, **kw)
-        self.photo_id, self.old, self.new = photo_id, old, new
+        self.changes = list(changes)
 
     def apply(self) -> None:
-        self.service.choose_face(self.entry_id, self.photo_id, self.new)
+        self._set([(pid, new) for pid, _, new in self.changes])
 
     def revert(self) -> None:
-        self.service.choose_face(self.entry_id, self.photo_id, self.old)
+        self._set([(pid, old) for pid, old, _ in reversed(self.changes)])
+
+    def _set(self, faces: list[tuple[str, Face | None]]) -> None:
+        entry = self._entry()
+        if any(entry.photo(pid) is None for pid, _ in faces):
+            raise LookupError("the photo is no longer in the album" if len(faces) == 1 else
+                              "some of the photos are no longer in the album")
+        for pid, face in faces:
+            self.service.choose_face(self.entry_id, pid, face)
 
 
 class SetPhotoNote(_PhotoCommand):
@@ -319,15 +332,19 @@ class SetPhotoNote(_PhotoCommand):
 # --- entries ------------------------------------------------------------------------------------
 
 class _EntryCommand(LibraryCommand):
-    def _delete(self) -> str:
-        return self.service.delete_entry(self.entry_id).id
+    def _delete(self, entry_ids: list[str]) -> dict[str, str | None]:
+        """Move entries to the Trash; returns their trash items (None: it was gone already)."""
+        return {eid: self.service.delete_entry(eid).id if self.service.has_entry(eid) else None
+                for eid in entry_ids}
 
-    def _bring_back(self, trash_id: str | None) -> None:
-        if self.service.has_entry(self.entry_id):         # restored from the Trash page already
-            return
-        if trash_id is None or not self.service.in_trash(trash_id):
-            raise LookupError("the entry is no longer in the Trash")
-        self.service.restore(trash_id)
+    def _bring_back(self, trash: dict[str, str | None]) -> None:
+        """Restore entries from the Trash: all of them or, if any is gone from there, none."""
+        missing = [eid for eid in trash if not self.service.has_entry(eid)]   # not restored on the Trash page
+        if any(trash[eid] is None or not self.service.in_trash(trash[eid]) for eid in missing):
+            raise LookupError("the entry is no longer in the Trash" if len(trash) == 1 else
+                              "some of the entries are no longer in the Trash")
+        for eid in missing:
+            self.service.restore(trash[eid])
 
 
 class NewEntry(_EntryCommand):
@@ -336,22 +353,26 @@ class NewEntry(_EntryCommand):
 
     def __init__(self, service, entry_id, **kw):
         super().__init__(service, entry_id, "New Entry", done_already=True, **kw)
-        self.trash_id: str | None = None
+        self.trash: dict[str, str | None] = {}
 
     def revert(self) -> None:
-        self.trash_id = self._delete()
+        self.trash = self._delete([self.entry_id])
 
     def apply(self) -> None:
-        self._bring_back(self.trash_id)
+        self._bring_back(self.trash)
 
 
-class DeleteEntry(_EntryCommand):
-    def __init__(self, service, entry_id, **kw):
-        super().__init__(service, entry_id, "Delete Entry", **kw)
-        self.trash_id: str | None = None
+class DeleteEntries(_EntryCommand):
+    def __init__(self, service, entry_ids: list[str], **kw):
+        super().__init__(service, entry_ids[0], f"Delete {plural(len(entry_ids), 'Entry', 'Entries')}", **kw)
+        self.entry_ids = list(entry_ids)
+        self.trash: dict[str, str | None] = {}
 
     def apply(self) -> None:
-        self.trash_id = self._delete()
+        self.trash = self._delete(self.entry_ids)
 
     def revert(self) -> None:
-        self._bring_back(self.trash_id)
+        self._bring_back(self.trash)
+
+    def shown_entry(self) -> list[str] | None:
+        return [eid for eid in self.entry_ids if self.service.has_entry(eid)] or None

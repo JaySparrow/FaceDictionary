@@ -48,6 +48,7 @@ class FaceImageView(QWidget):
         super().__init__(parent)
         self.interactive = interactive
         self.double_click = double_click
+        self.align_top = False                     # the photo starts at the top instead of the middle
         self._pixmap = QPixmap()
         self._scale = 1.0
         self._faces: list[Face] = []
@@ -94,7 +95,8 @@ class FaceImageView(QWidget):
         pw, ph = self._pixmap.width(), self._pixmap.height()
         k = min(self.width() / pw, self.height() / ph)
         w, h = pw * k, ph * k
-        return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
+        top = 0 if self.align_top else (self.height() - h) / 2
+        return QRectF((self.width() - w) / 2, top, w, h)
 
     def face_rect(self, index: int) -> QRectF:
         r = self.image_rect()

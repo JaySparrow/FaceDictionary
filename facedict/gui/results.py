@@ -13,7 +13,7 @@ from ..vault import VaultError
 from .common import (ClickableLabel, ElidedLabel, ScoreBar, bytes_to_pixmap, make_labels_selectable, muted,
                      placeholder_pixmap, rounded)
 
-THUMB = 84
+THUMB = 92
 
 
 class ResultCard(QFrame):
@@ -36,14 +36,12 @@ class ResultCard(QFrame):
         pic.setScaledContents(True)
 
         badge = QLabel(str(rank))
-        badge.setFixedSize(26, 26)
-        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setStyleSheet("background: palette(highlight); color: palette(highlighted-text); border-radius: 13px;"
-                            "font-weight: 700;")
+        badge.setObjectName("muted")
+        badge.setFixedWidth(14)
         self.name_label = ClickableLabel(title, "Open this entry")
         name = self.name_label
         f = name.font()
-        f.setPointSize(15)
+        f.setPointSize(17)
         name.setFont(f)
         for w in (pic, name):
             w.clicked.connect(lambda: self.open_clicked.emit(self.entry_id))
@@ -54,11 +52,16 @@ class ResultCard(QFrame):
 
         bar = ScoreBar()
         bar.set_score(score, low)
-        bar.setFixedWidth(120)
+        bar.setFixedWidth(110)
+        number = QLabel(f"{score:.3f}")
+        number.setObjectName("muted")
+        if score < low:
+            number.setStyleSheet("color: #d4761e;")             # a weak match
         sub = ElidedLabel(subtitle)
         score_row = QHBoxLayout()
         score_row.setSpacing(8)
-        score_row.addWidget(bar)
+        score_row.addWidget(bar, 0, Qt.AlignmentFlag.AlignVCenter)
+        score_row.addWidget(number)
         score_row.addWidget(sub, 1)
 
         buttons = QHBoxLayout()
@@ -87,7 +90,7 @@ class ResultCard(QFrame):
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(12)
+        lay.setSpacing(14)
         lay.addWidget(pic, 0, Qt.AlignmentFlag.AlignTop)
         lay.addLayout(info, 1)
 
