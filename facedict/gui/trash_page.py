@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QHeaderView, QMessageBox, QPus
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ..vault import RestoreConflictError
-from .common import add_copy_action, confirm, header_row, muted
+from .common import GAP, PAGE_MARGIN, add_copy_action, confirm, has_focus_in, header_row, muted
 from .history_page import fmt_time
 
 ROLE_ID = Qt.ItemDataRole.UserRole
@@ -36,8 +36,8 @@ class TrashPage(QWidget):
         self.purge_btn = QPushButton("Delete permanently…")
         self.purge_btn.clicked.connect(self.purge)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(6)
+        lay.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
+        lay.setSpacing(GAP)
         lay.addWidget(header_row("Trash", self.restore_btn, self.purge_btn))
         lay.addWidget(self.info)
         lay.addWidget(self.tree, 1)
@@ -107,6 +107,12 @@ class TrashPage(QWidget):
             self.service.purge(tid)
         self.refresh()
         self.changed.emit()
+
+    def delete_target(self, focus):
+        """What ⌫ deletes: the selected items, for good (after asking twice, as the button does)."""
+        if has_focus_in(self.tree, focus) and self._selected_ids():
+            return self.purge
+        return None
 
     def clear(self) -> None:
         self.tree.clear()

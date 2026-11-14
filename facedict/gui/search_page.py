@@ -6,10 +6,10 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QFrame, QLabel, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QSplitter, QVBoxLayout, QWidget
 
 from ..imageio import is_supported
-from .common import header_row, muted, open_images, qimage_to_png_bytes
+from .common import GAP, GUTTER, PAGE_MARGIN, header_row, icon_button, muted, open_images, qimage_to_png_bytes
 from .faces_view import QueryView, render_photo
 from .results import ResultsPanel
 
@@ -23,12 +23,7 @@ class DropZone(QFrame):
         self.setObjectName("dropzone")
         self.setAcceptDrops(True)
         self.view = QueryView()
-        self.hint = QLabel("Drop a photo here\n\nor click to choose one\n⌘V paste · ⌘O open")
-        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.hint.setObjectName("muted")
-        f = self.hint.font()
-        f.setPointSize(15)
-        self.hint.setFont(f)
+        self.hint = QWidget()                     # the empty zone: drop, click, ⌘V or ⌘O
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 14, 14, 14)
         lay.addWidget(self.hint, 1)
@@ -87,7 +82,6 @@ class SearchPage(QWidget):
     open_entry = Signal(str)
     searched = Signal(str)               # history id
     changed = Signal(str)
-    HINT = "Drop a photo, press ⌘V to paste one, or ⌘O to open one."
 
     def __init__(self, service, runner, parent=None):
         super().__init__(parent)
@@ -99,13 +93,15 @@ class SearchPage(QWidget):
         self.drop.dropped.connect(lambda data: self.search(data))
         self.drop.clicked.connect(self.open_photo)
         self.drop.view.face_selected.connect(self.select_face)
-        self.status = muted(self.HINT)
+        self.status = muted()
 
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
-        ll.setSpacing(6)
-        ll.addWidget(header_row("Search by face"))
+        ll.setSpacing(GAP)
+        self.open_btn = icon_button("plus", "Open a photo (⌘O)")      # also once a photo is shown
+        self.open_btn.clicked.connect(self.open_photo)
+        ll.addWidget(header_row("Search by face", self.open_btn))
         ll.addWidget(self.drop, 1)
 
         self.results = ResultsPanel(service, runner)
@@ -114,11 +110,12 @@ class SearchPage(QWidget):
         right = QWidget()
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(6)
+        rl.setSpacing(GAP)
         rl.addWidget(header_row("Best matches"))
         rl.addWidget(self.results, 1)
 
         split = QSplitter()
+        split.setHandleWidth(GUTTER)
         split.addWidget(left)
         split.addWidget(right)
         split.setStretchFactor(0, 6)
@@ -126,15 +123,15 @@ class SearchPage(QWidget):
         split.setChildrenCollapsible(False)
         split.setSizes([740, 420])                       # the photo gets the larger share
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(6)
+        lay.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
+        lay.setSpacing(GAP)
         lay.addWidget(split, 1)
         lay.addWidget(self.status)
 
     # --- input ---------------------------------------------------------------------------
 
     def open_photo(self) -> None:
-        paths = open_images(self, "Choose a photo to search", multiple=False)
+        paths = open_images(self, "Choose a photo to search", multiple=False, kind="search")
         if paths:
             try:
                 self.search(Path(paths[0]).read_bytes())
@@ -168,7 +165,7 @@ class SearchPage(QWidget):
             res, rendered = out
             self.drop.show_hint(False)
             self.drop.view.show_query(rendered, res.faces, res.selected, f"Search took {res.elapsed_ms:.0f} ms.")
-            self.status.setText(self.HINT)
+            self.status.setText("")
             if res.history is None:
                 self.results.clear("No face to search for.")
             else:
@@ -178,7 +175,7 @@ class SearchPage(QWidget):
                 QGuiApplication.clipboard().clear()
 
         def failed(exc):
-            self.status.setText(self.HINT)
+            self.status.setText("")
             self.results.clear(f"Could not search: {exc}")
 
         self.runner.submit(work, on_done=done, on_error=failed)
@@ -198,4 +195,4 @@ class SearchPage(QWidget):
         self.drop.view.clear()
         self.drop.show_hint(True)
         self.results.clear()
-        self.status.setText(self.HINT)
+        self.status.setText("")

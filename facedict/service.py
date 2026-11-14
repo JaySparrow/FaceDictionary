@@ -82,6 +82,15 @@ class AddPhotoResult:
 
 
 @dataclass
+class RemovedField:
+    """What removing a shared field took away, so that it can be put back exactly (undo)."""
+    spec: FieldDef
+    position: int                                          # its place among the shared fields
+    values: dict[str, str] = field(default_factory=dict)   # entry id -> the text it had there
+    converted: list[str] = field(default_factory=list)     # entries where that text became an own field
+
+
+@dataclass
 class ImportReport:
     entries_created: int = 0
     entries_updated: int = 0
@@ -484,6 +493,9 @@ class FaceDictionaryService:
     def get_entry(self, entry_id: str) -> Entry:
         return self._v().get_entry(entry_id)
 
+    def has_entry(self, entry_id: str) -> bool:
+        return self._v().has_entry(entry_id)
+
     def find_entry_by_name(self, name: str) -> Entry | None:
         key = fold(name)
         return next((e for e in self.list_entries() if fold(e.name) == key), None)
@@ -542,23 +554,54 @@ class FaceDictionaryService:
     def remove_global_field(self, field_id: str, keep_content: bool = True) -> int:
         """Remove a global field from the database. Entries that had text in it keep that text as a
         field of their own (unless `keep_content` is off). Returns how many entries kept content."""
+        removed = self.drop_global_field(field_id, keep_content)
+        return len(removed.converted) if removed else 0
+
+    def drop_global_field(self, field_id: str, keep_content: bool = True) -> RemovedField | None:
+        """Like remove_global_field, but returns everything needed to put the field back."""
         with self._lock:
             v = self._v()
             defs = self.global_fields()
-            gone = next((f for f in defs if f.id == field_id), None)
-            if gone is None:
-                return 0
-            kept = 0
+            position = next((i for i, f in enumerate(defs) if f.id == field_id), None)
+            if position is None:
+                return None
+            gone = defs[position]
+            removed = RemovedField(FieldDef(gone.id, gone.name), position)
             for entry in v.list_entries():
                 if field_id not in entry.fields:
                     continue
                 text = entry.fields.pop(field_id)
+                removed.values[entry.id] = text
                 if text and keep_content and entry.own_field(gone.name) is None:
                     entry.own.append(OwnField(gone.name, text))
-                    kept += 1
+                    removed.converted.append(entry.id)
                 v.save_entry(entry)
             v.set_field_defs([f for f in defs if f.id != field_id])
-            return kept
+            return removed
+
+    def reinstate_global_field(self, removed: RemovedField) -> FieldDef:
+        """Put a removed shared field back: same id, same place, and each entry's text in it."""
+        with self._lock:
+            v = self._v()
+            defs = self.global_fields()
+            if any(f.id == removed.spec.id for f in defs):
+                raise ServiceError(f"The field “{removed.spec.name}” is already there")
+            if any(fold(f.name) == fold(removed.spec.name) for f in defs):
+                raise ServiceError(f"There is already a field called “{removed.spec.name}”")
+            spec = FieldDef(removed.spec.id, removed.spec.name)
+            position = min(max(0, removed.position), len(defs))
+            v.set_field_defs(defs[:position] + [spec] + defs[position:])
+            for entry_id, text in removed.values.items():
+                if not v.has_entry(entry_id):
+                    continue
+                entry = v.get_entry(entry_id)
+                if entry_id in removed.converted:
+                    own = entry.own_field(spec.name)
+                    if own is not None and own.value == text:
+                        entry.own.remove(own)
+                entry.fields[spec.id] = text
+                v.save_entry(entry)
+            return spec
 
     # --- photos order ----------------------------------------------------------------------------------
 
@@ -631,6 +674,16 @@ class FaceDictionaryService:
             self._index_add(pid, entry_id, eng.embed(img, face), eng.model_name, flush=flush)
         return AddPhotoResult(ref, face_count=len(faces))
 
+    def set_photo_note(self, entry_id: str, photo_id: str, note: str) -> PhotoRef:
+        v = self._v()
+        entry = v.get_entry(entry_id)
+        ref = entry.photo(photo_id)
+        if ref is None:
+            raise ServiceError("Photo not found in entry")
+        ref.note = note.strip()
+        v.save_entry(entry)
+        return ref
+
     def detect_faces(self, photo_id: str) -> tuple[np.ndarray, list[Face]]:
         img = decode(self._v().get_photo(photo_id))
         return img, self.engine().detect(img)
@@ -692,6 +745,9 @@ class FaceDictionaryService:
 
     def list_trash(self) -> list[TrashItem]:
         return self._v().list_trash()
+
+    def in_trash(self, trash_id: str) -> bool:
+        return self._v().has_trash(trash_id)
 
     def restore(self, trash_id: str) -> TrashItem:
         item = self._v().restore(trash_id)
@@ -764,6 +820,7 @@ class FaceDictionaryService:
                     report.entries_created += 1
                 else:
                     report.entries_updated += 1
+                notes = meta.get("photo_notes") if isinstance(meta.get("photo_notes"), dict) else {}
                 for f in files:
                     if cancel and cancel():
                         break
@@ -779,6 +836,8 @@ class FaceDictionaryService:
                         report.photos_added += 1
                         report.no_face += res.face_count == 0
                         report.multi_face += res.face_count > 1
+                        if str(notes.get(f.name, "")).strip():
+                            self.set_photo_note(entry.id, res.photo.photo_id, str(notes[f.name]))
                     done += 1
                     if progress:
                         progress(done, total)
@@ -789,7 +848,8 @@ class FaceDictionaryService:
     def _fields_from_meta(self, meta: dict) -> tuple[dict, list[OwnField]]:
         """entry.json keys become values of the global field with that name, or fields of this entry.
         “notes” always becomes the global Notes field."""
-        skip = {"id", "name", "aliases", "tags", "photos", "created_at", "updated_at", "fields", "own"}
+        skip = {"id", "name", "aliases", "tags", "photos", "photo_notes", "created_at", "updated_at", "fields",
+                "own"}
         pairs: list[tuple[str, str]] = []
         for key, value in meta.items():
             if key in skip:
@@ -828,7 +888,7 @@ class FaceDictionaryService:
         for own in entry.own:
             doc.setdefault(own.name, own.value)
         doc["created_at"], doc["updated_at"] = entry.created_at, entry.updated_at
-        (folder / "entry.json").write_text(json.dumps(doc, ensure_ascii=False, indent=2), "utf-8")
+        notes = {}
         for i, ref in enumerate(entry.photos, 1):
             data = v.get_photo(ref.photo_id)
             ext = ".jpg"
@@ -839,6 +899,11 @@ class FaceDictionaryService:
             except Exception:
                 pass
             (folder / f"photo_{i:03d}{ext}").write_bytes(data)
+            if ref.note:
+                notes[f"photo_{i:03d}{ext}"] = ref.note
+        if notes:
+            doc["photo_notes"] = notes
+        (folder / "entry.json").write_text(json.dumps(doc, ensure_ascii=False, indent=2), "utf-8")
         return folder
 
     # --- misc ------------------------------------------------------------------------------------------------

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QScrollArea, QSizePolicy, QToolButton, QVBoxLayout,
                                QWidget)
@@ -38,14 +38,16 @@ def render_photo(image: np.ndarray, faces: list[Face]) -> RenderedPhoto:
 
 
 class FaceImageView(QWidget):
-    """Draws the photo scaled to fit and a box around each face. Click (or ←/→, 1–9) picks a face."""
+    """Draws the photo scaled to fit and a box around each face. Click (or ←/→, 1–9) picks a face.
+    With `double_click`, only a double-click picks one (for choices that are saved at once)."""
 
     face_clicked = Signal(int)
 
-    def __init__(self, interactive: bool = True, min_size: QSize = QSize(260, 260), parent=None):
+    def __init__(self, interactive: bool = True, min_size: QSize = QSize(260, 260), double_click: bool = False,
+                 parent=None):
         super().__init__(parent)
         self.interactive = interactive
-        self.hover_text = "Face {n} – click to see its matches"
+        self.double_click = double_click
         self._pixmap = QPixmap()
         self._scale = 1.0
         self._faces: list[Face] = []
@@ -67,7 +69,6 @@ class FaceImageView(QWidget):
     def clear(self) -> None:
         self.set_content(QPixmap(), 1.0, [], -1)
         self.unsetCursor()
-        self.setToolTip("")
 
     def set_selected(self, index: int) -> None:
         self._selected = index
@@ -163,10 +164,8 @@ class FaceImageView(QWidget):
             self._hover = hover
             if hover >= 0:
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
-                self.setToolTip(self.hover_text.format(n=hover + 1))
             else:
                 self.unsetCursor()
-                self.setToolTip("")
             self.update()
 
     def leaveEvent(self, _event) -> None:
@@ -180,11 +179,20 @@ class FaceImageView(QWidget):
         hit = self.face_at(event.position())
         if hit >= 0:
             self.setFocus()
-            self.face_clicked.emit(hit)
+            if not self.double_click:
+                self.face_clicked.emit(hit)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if not self.double_click:
+            return self.mousePressEvent(event)
+        if self.interactive and event.button() == Qt.MouseButton.LeftButton:
+            hit = self.face_at(event.position())
+            if hit >= 0:
+                self.face_clicked.emit(hit)
 
     def keyPressEvent(self, event) -> None:
         n = len(self._faces)
-        if not self.interactive or n < 2:
+        if not self.interactive or n < 2 or self.double_click:
             return super().keyPressEvent(event)
         key = event.key()
         cur = max(self._selected, 0)
@@ -198,13 +206,31 @@ class FaceImageView(QWidget):
             super().keyPressEvent(event)
 
 
+class _DoubleClickOnly(QObject):
+    """Makes a button ignore single clicks and report double-clicks instead."""
+
+    def __init__(self, strip: "FaceStrip"):
+        super().__init__(strip)
+        self.strip = strip
+
+    def eventFilter(self, obj, event) -> bool:
+        kind = event.type()
+        if kind == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
+            if obj in self.strip.buttons:
+                self.strip.face_clicked.emit(self.strip.buttons.index(obj))
+            return True
+        return kind in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease)
+
+
 class FaceStrip(QScrollArea):
     """A row of numbered face thumbnails; handy for small faces in group photos."""
 
     face_clicked = Signal(int)
 
-    def __init__(self, parent=None):
+    def __init__(self, double_click: bool = False, parent=None):
         super().__init__(parent)
+        self.double_click = double_click
+        self._double = _DoubleClickOnly(self) if double_click else None
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -217,8 +243,15 @@ class FaceStrip(QScrollArea):
         self.setWidget(self._holder)
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
-        self.group.idClicked.connect(self.face_clicked.emit)
+        self.group.idClicked.connect(self._clicked)
         self.buttons: list[QToolButton] = []
+        self._selected = -1
+
+    def _clicked(self, index: int) -> None:
+        if self.double_click:                       # only a double-click counts (see _DoubleClickOnly)
+            self.set_selected(self._selected)
+            return
+        self.face_clicked.emit(index)
 
     def set_faces(self, chips: list[QPixmap], selected: int) -> None:
         self.clear()
@@ -229,13 +262,16 @@ class FaceStrip(QScrollArea):
             b.setIconSize(QSize(CHIP, CHIP))
             b.setText(str(i + 1))
             b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-            b.setToolTip(f"Face {i + 1}")
+            if self._double is not None:
+                b.installEventFilter(self._double)
+                b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             self.group.addButton(b, i)
             self._row.insertWidget(i, b)
             self.buttons.append(b)
         self.set_selected(selected)
 
     def set_selected(self, index: int) -> None:
+        self._selected = index
         if 0 <= index < len(self.buttons):
             self.buttons[index].setChecked(True)
             self.ensureWidgetVisible(self.buttons[index])
@@ -251,14 +287,12 @@ class QueryView(QWidget):
     """Photo with clickable faces + face strip + a one-line summary. Emits the chosen face."""
 
     face_selected = Signal(int)
-    SEARCH_HINT = "Click another face (or use ← →) to see its matches."
 
-    def __init__(self, interactive: bool = True, hint: str = SEARCH_HINT, parent=None):
+    def __init__(self, interactive: bool = True, double_click: bool = False, parent=None):
         super().__init__(parent)
         self.interactive = interactive
-        self.hint = hint
-        self.image = FaceImageView(interactive)
-        self.strip = FaceStrip()
+        self.image = FaceImageView(interactive, double_click=double_click)
+        self.strip = FaceStrip(double_click)
         self.info = muted()
         self._extra = ""
         self.image.face_clicked.connect(self._picked)
@@ -299,11 +333,11 @@ class QueryView(QWidget):
     def _update_info(self) -> None:
         n, i = self.image.face_count, self.image.selected
         if n == 0:
-            text = "No face found in this photo. Try a clearer, more front-facing photo."
+            text = "No face found in this photo."
         elif n == 1:
             text = "1 face found."
         elif self.interactive:
-            text = f"{n} faces found – face {i + 1} is selected. {self.hint}"
+            text = f"{n} faces found – face {i + 1} is selected."
         else:
             text = f"{n} faces found."
         self.info.setText(" ".join(t for t in (text, self._extra) if t))

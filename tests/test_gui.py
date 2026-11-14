@@ -73,6 +73,35 @@ def run_search(win, qtbot, data):
     qtbot.waitUntil(lambda: len(win.search.results.cards()) == 5, timeout=20000)
 
 
+def open_inline(qtbot, inline):
+    """Double-click a piece of text of the entry page (a click is enough where it is empty)."""
+    qtbot.mouseDClick(inline.label, Qt.MouseButton.LeftButton, pos=QPoint(6, 6))
+    assert inline.editing and inline.editor.isVisible()
+
+
+def type_inline(qtbot, inline, text: str, finish: str = "enter"):
+    """Open a text, replace what it says and close it: "enter" (⌘Enter for several lines), "esc",
+    or "click" (somewhere else on the page)."""
+    open_inline(qtbot, inline)
+    if inline.multiline:
+        inline.editor.setPlainText(text)
+    else:
+        inline.editor.setText(text)                    # QTest cannot type CJK; an IME would
+    if finish == "enter":
+        mod = Qt.KeyboardModifier.ControlModifier if inline.multiline else Qt.KeyboardModifier.NoModifier
+        qtbot.keyClick(inline.editor, Qt.Key.Key_Return, mod)
+    elif finish == "esc":
+        qtbot.keyClick(inline.editor, Qt.Key.Key_Escape)
+    else:
+        page = inline.window()
+        qtbot.mouseClick(page.library.stamps, Qt.MouseButton.LeftButton)
+    assert not inline.editing
+
+
+def idle(win, qtbot):
+    qtbot.waitUntil(lambda: not win.runner.busy, timeout=20000)
+
+
 # --- vault creation / unlocking ---------------------------------------------------------------
 
 def test_create_vault_then_security_questions(win, qtbot, monkeypatch):
@@ -173,7 +202,8 @@ def test_lock_clears_all_personal_data_from_the_ui(ready, qtbot, people):
     view = ready.search.drop.view
     assert not view.image.has_image and view.image.face_count == 0 and view.strip.buttons == []
     assert ready.library.list.count() == 0 and ready.library.photos.count() == 0
-    assert ready.library.name_edit.text() == "" and ready.history.list.count() == 0
+    assert ready.library.title.text == "" and ready.library.title.editor.text() == ""
+    assert ready.history.list.count() == 0
     assert ready.windowTitle().endswith("Locked")
 
 
@@ -196,15 +226,17 @@ def test_lock_closes_open_dialogs(ready, qtbot):
     assert not dlg.isVisible()
 
 
-def test_unsaved_edits_are_saved_on_lock(ready, qtbot):
+def test_text_being_typed_is_saved_on_lock(ready, qtbot):
     ready.nav.setCurrentRow(2)
     ready.library.list.setCurrentRow(0)
     lib = ready.library
     entry_id = lib.entry.id
-    lib.set_editing(True)
-    qtbot.keyClicks(lib.name_edit, " (tennis)")
+    open_inline(qtbot, lib.title)
+    lib.title.editor.end(False)
+    qtbot.keyClicks(lib.title.editor, " (tennis)")
     assert lib.has_unsaved_changes
     ready.lock()
+    assert lib.undo_stack.count() == 0                       # the undo history is forgotten too
     ready.service.unlock(PW)
     assert ready.service.get_entry(entry_id).name.endswith(" (tennis)")
 
@@ -217,13 +249,11 @@ def test_edit_delete_restore_entry(ready, qtbot, monkeypatch):
     ready.library.list.setCurrentRow(0)
     lib = ready.library
     entry = lib.entry
-    assert not lib.editing and lib.edit_btn.isVisible()        # a selected entry is read-only first
-    lib.edit_btn.click()
-    assert lib.editing and lib.name_edit.isVisible() and not lib.export_btn.isVisible()
-    qtbot.keyClicks(lib.aliases, "Nick, Nicky")
-    lib.save_btn.click()
+    assert not lib.aliases_text.editing and lib.aliases_text.empty      # text reads like a label first
+    assert lib.aliases_text.label.text() == "Aliases"
+    type_inline(qtbot, lib.aliases_text, "Nick, Nicky")
     assert ready.service.get_entry(entry.id).aliases == ["Nick", "Nicky"]
-    assert not lib.editing                                     # saving returns to the read-only page
+    assert lib.aliases_text.label.full_text == "·  Nick  ·  Nicky"
     n = lib.list.count()
     lib.delete_entry()
     assert ready.library.list.count() == n - 1
@@ -352,7 +382,7 @@ def test_hovering_a_face_highlights_it(ready, qtbot, group):
     img = ready.search.drop.view.image
     qtbot.mouseMove(img, img.face_rect(1).center().toPoint())
     qtbot.waitUntil(lambda: img._hover == 1, timeout=2000)
-    assert "Face 2" in img.toolTip()
+    assert img.toolTip() == ""                               # no tooltips, just the yellow box
     qtbot.mouseMove(img, img.image_rect().topLeft().toPoint() + QPoint(2, 2))
     qtbot.waitUntil(lambda: img._hover == -1, timeout=2000)
 
@@ -390,25 +420,50 @@ def test_history_page_switches_faces(ready, qtbot, group):
     qtbot.waitUntil(lambda: ready.service.list_history()[0].selected == 1, timeout=5000)
 
 
-def test_photo_dialog_picks_the_face_used_for_matching(ready, qtbot, group):
-    """Double-clicking a photo opens it big; clicking a face there applies it right away."""
+def dclick_face(qtbot, view, index):
+    qtbot.mouseDClick(view, Qt.MouseButton.LeftButton, pos=view.face_rect(index).center().toPoint())
+
+
+def test_photo_dialog_double_click_picks_the_face_used_for_matching(ready, qtbot, group):
+    """Double-clicking a photo opens it big; there a single click on a face changes nothing (no
+    accidents), a double-click uses that face at once, and ⌘Z goes back to the previous one."""
     from facedict.gui.library_page import PhotoDialog
     data, expected = group
     entry = ready.service.get_entry(expected[1])
     res = ready.service.add_photo(entry.id, data)
+    lib = open_entry(ready)
+    lib.select_entry(entry.id)
     img, faces = ready.service.detect_faces(res.photo.photo_id)
     dlg = PhotoDialog(ready.service, ready.runner, entry.id, res.photo, img, faces, ready)
+    dlg.face_changed.connect(lambda pid, old, new: lib._face_changed(entry.id, pid, old, new))
     qtbot.addWidget(dlg)
     dlg.show()
     qtbot.waitExposed(dlg)
+    assert dlg.view.image.interactive and dlg.view.image.double_click
     assert dlg.view.image.selected == 2                     # the largest face, chosen when the photo was added
-    assert "Face 3" in dlg.status.text()
+    assert dlg.view.info.isHidden()                         # nothing written under the photo
+
     def stored_face():
         return ready.service.get_entry(entry.id).photo(res.photo.photo_id).face
 
-    click_face(qtbot, dlg.view.image, 1)                    # no confirmation button: the click is the choice
+    before = stored_face()
+    click_face(qtbot, dlg.view.image, 0)                    # a single click: nothing happens
+    qtbot.mouseClick(dlg.view.strip.buttons[0], Qt.MouseButton.LeftButton)     # nor on the thumbnails
+    dlg.view.strip.buttons[0].click()
+    qtbot.wait(200)
+    assert stored_face() == before and dlg.view.image.selected == 2
+
+    dclick_face(qtbot, dlg.view.image, 1)                   # a double-click is the choice
     qtbot.waitUntil(lambda: abs(stored_face().bbox[0] - dlg.faces[1].bbox[0]) < 1, timeout=10000)
-    qtbot.waitUntil(lambda: "Face 2" in dlg.status.text(), timeout=5000)
+    qtbot.waitUntil(lambda: ready.undo_action.text() == "Undo Change Face", timeout=5000)
+    qtbot.mouseDClick(dlg.view.strip.buttons[0], Qt.MouseButton.LeftButton)   # or double-click a thumbnail
+    qtbot.waitUntil(lambda: abs(stored_face().bbox[0] - dlg.faces[0].bbox[0]) < 1, timeout=10000)
+    dlg.close()
+    idle(ready, qtbot)
+    ready.undo_action.trigger()
+    assert abs(stored_face().bbox[0] - dlg.faces[1].bbox[0]) < 1
+    ready.undo_action.trigger()                                  # step by step back to the first choice
+    assert abs(stored_face().bbox[0] - before.bbox[0]) < 1
 
 
 def test_the_no_entry_button_excludes_a_photo_from_matching(ready, qtbot):
@@ -418,6 +473,7 @@ def test_the_no_entry_button_excludes_a_photo_from_matching(ready, qtbot):
     lib.photos.setCurrentRow(0)
     pid = lib.entry.photos[0].photo_id
     assert pid in ready.service.index and not lib.exclude_btn.isChecked()
+    assert lib.exclude_btn.isVisible()                      # always there: no edit mode
     lib.exclude_btn.click()
     qtbot.waitUntil(lambda: lib.entry.photo(pid).face is None, timeout=10000)   # after the page refreshed
     assert pid not in ready.service.index
@@ -428,6 +484,11 @@ def test_the_no_entry_button_excludes_a_photo_from_matching(ready, qtbot):
     assert pid in ready.service.index
     lib.photos.setCurrentRow(0)
     assert not lib.exclude_btn.isChecked()
+    idle(ready, qtbot)
+    ready.undo_action.trigger()                             # ⌘Z: switched off again
+    assert ready.service.get_entry(lib.entry.id).photo(pid).face is None and pid not in ready.service.index
+    ready.redo_action.trigger()                             # ⇧⌘Z: and on
+    assert ready.service.get_entry(lib.entry.id).photo(pid).face is not None and pid in ready.service.index
 
 
 def test_clicking_the_empty_search_zone_opens_a_photo(ready, qtbot, people, monkeypatch, tmp_path):
@@ -559,7 +620,7 @@ def test_settings_show_and_set_recovery_methods(ready, qtbot, monkeypatch):
     assert saved["password"] == PW and "security questions (2 of 3" in dlg.recovery.text()
 
 
-# --- entry page: read-only, editing, fields ---------------------------------------------------------
+# --- entry page: editing in place, fields ----------------------------------------------------------
 
 def open_entry(ready, row: int = 0):
     ready.nav.setCurrentRow(2)
@@ -567,42 +628,53 @@ def open_entry(ready, row: int = 0):
     return ready.library
 
 
-def field_rows(lib):
-    return {key: row for _kind, key, row in lib._rows}
+def add_field(qtbot, lib, kind: str, name: str, value: str | None = None):
+    """Add Field to All Entries / to This Entry (right-click, Edit menu, ⇧⌘; / ⌘;): type the name,
+    Enter, then the text (⌘Enter)."""
+    lib.add_actions[kind].trigger()
+    row = next(r for r in lib.body_holder.findChildren(library_page.FieldRow) if r.name.editing)
+    row.name.editor.setText(name)
+    qtbot.keyClick(row.name.editor, Qt.Key.Key_Return)
+    key = next(k for k, r in lib._rows.items() if r.field_name == name)
+    qtbot.waitUntil(lambda: lib._rows[key].value.editing, timeout=3000)     # Enter goes on to the text
+    value_box = lib._rows[key].value
+    if value is None:
+        qtbot.keyClick(value_box.editor, Qt.Key.Key_Escape)
+    else:
+        value_box.editor.setPlainText(value)
+        qtbot.keyClick(value_box.editor, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
+    return key
 
 
-def test_shared_and_own_fields_in_the_entry_page(ready, qtbot, monkeypatch):
-    from facedict.gui.library_page import AddFieldDialog
+def test_shared_and_own_fields_in_the_entry_page(ready, qtbot):
     lib = open_entry(ready)
     entry_id = lib.entry.id
-    lib.edit_btn.click()
-
-    monkeypatch.setattr(AddFieldDialog, "exec", lambda self: 1)
-    monkeypatch.setattr(AddFieldDialog, "values", lambda self: ("Met at", True))
-    lib.add_field()
-    spec = next(f for f in ready.service.global_fields() if f.name == "Met at")
-    field_rows(lib)[spec.id].editor.setPlainText("the 2019 conference")
-
-    monkeypatch.setattr(AddFieldDialog, "values", lambda self: ("Phone", False))
-    lib.add_field()
-    field_rows(lib)["Phone"].editor.setPlainText("555-11")
-    lib.save_btn.click()
-
+    met = add_field(qtbot, lib, "shared", "Met at", "the 2019 conference")
+    phone = add_field(qtbot, lib, "own", "Phone", "555-11")
     stored = ready.service.get_entry(entry_id)
-    assert stored.fields[spec.id] == "the 2019 conference"
-    assert [(f.name, f.value) for f in stored.own] == [("Phone", "555-11")]
+    assert met[0] == "field" and stored.fields[met[1]] == "the 2019 conference"
+    assert [(f.name, f.value) for f in stored.own] == [("Phone", "555-11")] and phone == ("own", "Phone")
 
-    # the read-only page shows both, and only fields that have text
-    texts = [w.field_name for w in lib.view_body.parent().findChildren(library_page.FieldRow)]
-    assert "Met at" in texts and "Phone" in texts
-
-    # the shared field is on every entry, empty until filled in
+    # the shared field is on every entry: shown dimmed while empty, a click fills it in
     other = open_entry(ready, 1)
-    other.edit_btn.click()
-    assert spec.id in field_rows(other) and field_rows(other)[spec.id].editor.toPlainText() == ""
-    other.cancel_btn.click()
+    row = other._rows[met]
+    assert row.value.empty and row.value.label.text() == "—" and row.name.label.property("empty")
+    assert ("own", "Phone") not in other._rows
+    qtbot.mouseClick(row.value.label, Qt.MouseButton.LeftButton)
+    assert row.value.editing
+    qtbot.keyClick(row.value.editor, Qt.Key.Key_Escape)
 
-    # and the search box can look inside it
+    # names must stay unique; Enter on a taken name keeps the box open
+    other.add_actions["own"].trigger()
+    new_row = next(r for r in other.body_holder.findChildren(library_page.FieldRow) if r.name.editing)
+    new_row.name.editor.setText("met AT")
+    qtbot.keyClick(new_row.name.editor, Qt.Key.Key_Return)
+    assert new_row.name.editing
+    qtbot.keyClick(new_row.name.editor, Qt.Key.Key_Escape)          # Esc: nothing is added
+    qtbot.waitUntil(lambda: not any(r.name.editing for r in other.body_holder.findChildren(library_page.FieldRow)))
+    assert ready.service.get_entry(other.entry.id).own == []
+
+    # the search box can look inside it
     assert other.scope.itemText(3) == "Met at"
     other.scope.setCurrentIndex(3)
     other.filter.setText("2019 conference")
@@ -611,23 +683,235 @@ def test_shared_and_own_fields_in_the_entry_page(ready, qtbot, monkeypatch):
     assert visible == [entry_id]
 
 
-def test_removing_a_shared_field_keeps_its_text(ready, qtbot, monkeypatch):
-    from facedict.gui.library_page import AddFieldDialog
+def test_renaming_and_removing_fields_can_be_undone(ready, qtbot, monkeypatch):
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: True)
     lib = open_entry(ready)
     entry_id = lib.entry.id
-    lib.edit_btn.click()
-    monkeypatch.setattr(AddFieldDialog, "exec", lambda self: 1)
-    monkeypatch.setattr(AddFieldDialog, "values", lambda self: ("City", True))
-    lib.add_field()
-    spec = next(f for f in ready.service.global_fields() if f.name == "City")
-    field_rows(lib)[spec.id].editor.setPlainText("Lisbon")
-    lib.save_btn.click()
-    lib.edit_btn.click()
-    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: True)
-    lib.remove_field("global", spec.id, "City")
-    assert "City" not in [f.name for f in ready.service.global_fields()]
+    city = add_field(qtbot, lib, "shared", "City", "Lisbon")
+    type_inline(qtbot, lib._rows[city].name, "Town")                  # double-click a name to rename it
+    assert [f.name for f in ready.service.global_fields()] == ["Town"]
+
+    title, remove = lib._rows[city].name.menu_actions[0]                # the right-click menu
+    assert title == "Remove “Town”"                                      # says which field goes
+    remove()
+    assert ready.service.global_fields() == []
     stored = ready.service.get_entry(entry_id)
-    assert ("City", "Lisbon") in [(f.name, f.value) for f in stored.own]
+    assert ("Town", "Lisbon") in [(f.name, f.value) for f in stored.own]  # the text is kept
+
+    ready.undo_action.trigger()                                        # the field is back, with its text
+    assert [f.name for f in ready.service.global_fields()] == ["Town"]
+    stored = ready.service.get_entry(entry_id)
+    assert stored.fields[city[1]] == "Lisbon" and stored.own == []
+    ready.undo_action.trigger()
+    assert [f.name for f in ready.service.global_fields()] == ["City"]
+
+    own = add_field(qtbot, lib, "own", "Phone", "555")
+    lib._rows[own].value.menu_actions[0][1]()                          # right-click › Remove “Phone”
+    assert ready.service.get_entry(entry_id).own == []
+    ready.undo_action.trigger()
+    assert [(f.name, f.value) for f in ready.service.get_entry(entry_id).own] == [("Phone", "555")]
+
+
+def test_fields_are_added_from_menus_and_one_line_separates_own_fields(ready, qtbot):
+    lib = open_entry(ready)
+    labels = [a.text() for a in ready.menuBar().actions()[0].menu().actions() if a.text()]
+    assert labels[-2:] == ["Add Field to All Entries", "Add Field to This Entry"]       # Edit menu
+    assert lib.add_actions["own"].shortcut().toString() == "Ctrl+;"
+    from PySide6.QtWidgets import QAbstractButton
+    assert lib._divider is None and not lib.body_holder.findChildren(QAbstractButton)     # no buttons there
+    lib.add_actions["own"].trigger()                                  # a line appears with the new row
+    qtbot.waitUntil(lambda: lib._divider is not None and lib._divider.isVisibleTo(lib), timeout=2000)
+    new_row = next(r for r in lib.body_holder.findChildren(library_page.FieldRow) if r.name.editing)
+    qtbot.keyClick(new_row.name.editor, Qt.Key.Key_Escape)            # nothing added: and no line
+    assert lib._divider is None
+    key = add_field(qtbot, lib, "own", "Phone", "555")
+    assert lib._divider is not None and lib._rows[key].personal
+    ready.undo_action.trigger()
+    ready.undo_action.trigger()
+    assert lib._divider is None and ready.service.get_entry(lib.entry.id).own == []
+
+
+def test_aliases_can_be_selected_and_the_status_bar_is_quiet(ready, qtbot):
+    lib = open_entry(ready)
+    type_inline(qtbot, lib.aliases_text, "Nick")
+    assert lib.aliases_text.label.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+    ready._update_status()
+    assert ready.stats.text() == ""                                   # no counts, no model name
+
+
+def test_clearing_a_field_name_removes_the_field(ready, qtbot, monkeypatch):
+    lib = open_entry(ready)
+    entry_id = lib.entry.id
+    phone = add_field(qtbot, lib, "own", "Phone", "555")
+    type_inline(qtbot, lib._rows[phone].name, "")                      # no name: no field
+    assert ready.service.get_entry(entry_id).own == []
+    ready.undo_action.trigger()
+    assert [f.name for f in ready.service.get_entry(entry_id).own] == ["Phone"]
+
+    city = add_field(qtbot, lib, "shared", "City", "Lisbon")
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: False)   # a shared field asks first
+    type_inline(qtbot, lib._rows[city].name, "")
+    assert [f.name for f in ready.service.global_fields()] == ["City"] and lib._rows[city].name.text == "City"
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: True)
+    type_inline(qtbot, lib._rows[city].name, "")
+    assert ready.service.global_fields() == []
+
+
+def test_a_field_row_is_marked_while_its_menu_is_open(ready, qtbot, monkeypatch):
+    from facedict.models import OwnField
+    lib = open_entry(ready)
+    e = ready.service.get_entry(lib.entry.id)
+    e.own.append(OwnField("Phone", "555"))
+    ready.service.update_entry(e)
+    lib.refresh(e.id)
+    row = lib._rows[("own", "Phone")]
+    assert not row.value.editing and not row.marked
+    seen = []
+
+    def fake_exec(menu, _at):
+        seen.append((row.marked, [a.text() for a in menu.actions() if a.text()]))
+        return next(a for a in menu.actions() if a.text() == "Remove “Phone”")
+
+    monkeypatch.setattr(library_page, "exec_menu", fake_exec)
+    from PySide6.QtGui import QContextMenuEvent
+    event = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, QPoint(5, 5))
+    row.value.contextMenuEvent(event)
+    assert seen[0][0] is True and not row.marked                      # marked only while it is open
+    assert seen[0][1][:3] == ["Copy", "Edit…", "Remove “Phone”"]
+    qtbot.waitUntil(lambda: ready.service.get_entry(lib.entry.id).own == [], timeout=3000)   # runs afterwards
+
+
+def test_photos_can_be_dropped_into_the_album_and_o_adds_them(ready, qtbot, people, monkeypatch):
+    from PySide6.QtCore import QMimeData, QUrl
+    lib = open_entry(ready)
+    name = lib.entry.name.replace(" ", "_")
+    photo = people[name][-1]
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(photo)), QUrl.fromLocalFile(str(photo.parent))])
+    assert library_page.dropped_images(mime) == [photo]                # photo files only
+    before = lib.photos.count()
+    lib.photos.dropped.emit([photo])                                   # what a drop from Finder does
+    qtbot.waitUntil(lambda: lib.photos.count() == before + 1, timeout=20000)
+    idle(ready, qtbot)
+    ready.undo_action.trigger()
+    assert lib.photos.count() == before
+
+    monkeypatch.setattr(library_page, "open_images", lambda *a, **k: [str(photo)])
+    ready._open_shortcut()                                             # ⌘O on the Library page
+    qtbot.waitUntil(lambda: lib.photos.count() == before + 1, timeout=20000)
+    assert ready.page_stack.currentWidget() is lib
+
+
+def test_file_dialogs_start_in_the_last_folder_used(ready, tmp_path, monkeypatch):
+    starts = []
+
+    def fake(parent, title, start, *a, **k):
+        starts.append(start)
+        return [str(tmp_path / "pics" / "a.jpg")], ""
+
+    (tmp_path / "pics").mkdir()
+    monkeypatch.setattr(common, "_LAST_FOLDERS", {})
+    monkeypatch.setattr(common.QFileDialog, "getOpenFileNames", fake)
+    common.open_images(ready, kind="album")
+    common.open_images(ready, kind="album")
+    common.open_images(ready, kind="search")                           # each kind remembers its own
+    assert starts == [str(Path.home()), str(tmp_path / "pics"), str(Path.home())]
+    assert "pics" not in " ".join(QSettings().allKeys())                # kept in memory, never saved
+
+
+def test_the_plus_button_opens_a_new_search_when_a_photo_is_shown(ready, qtbot, people, monkeypatch, tmp_path):
+    from facedict.gui import search_page
+    run_search(ready, qtbot, held_out(people, 0)[1])
+    first = ready.search.results.record.id
+    photo = tmp_path / "next.jpg"
+    photo.write_bytes(held_out(people, 1)[1])
+    monkeypatch.setattr(search_page, "open_images", lambda *a, **k: [str(photo)])
+    ready.search.open_btn.click()
+    qtbot.waitUntil(lambda: ready.search.results.record is not None and ready.search.results.record.id != first,
+                    timeout=20000)
+
+
+def test_a_photo_has_a_note_of_its_own(ready, qtbot):
+    from facedict.gui.library_page import PhotoDialog
+    lib = open_entry(ready)
+    ref = lib.entry.photos[0]
+    img, faces = ready.service.detect_faces(ref.photo_id)
+    dlg = PhotoDialog(ready.service, ready.runner, lib.entry.id, ref, img, faces, ready)
+    dlg.save_note = lambda pid, old, new: lib._push(
+        library_page.undo.SetPhotoNote(ready.service, lib.entry.id, pid, old, new, **lib._callbacks()), light=True)
+    qtbot.addWidget(dlg)
+    dlg.show()
+    qtbot.waitExposed(dlg)
+    assert dlg.note.empty and dlg.note.label.text() == "Note"
+    open_inline(qtbot, dlg.note)
+    dlg.note.editor.setPlainText("At the lake, summer 2019")
+    dlg.reject()                                                       # closing keeps what was typed
+    stored = ready.service.get_entry(lib.entry.id).photo(ref.photo_id)
+    assert stored.note == "At the lake, summer 2019"
+    ready.undo_action.trigger()
+    assert ready.service.get_entry(lib.entry.id).photo(ref.photo_id).note == ""
+
+
+def test_the_delete_key_deletes_what_is_selected_on_every_page(ready, qtbot, people, monkeypatch):
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: True)
+    from facedict.gui import history_page, trash_page
+    monkeypatch.setattr(history_page, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(trash_page, "confirm", lambda *a, **k: True)
+    svc = ready.service
+    lib = open_entry(ready)
+    entry_id = lib.entry.id
+    n_photos = len(lib.entry.photos)
+
+    lib.filter.setFocus()                                              # typing keeps ⌫ for itself
+    lib.filter.setText("ab")
+    qtbot.keyClick(lib.filter, Qt.Key.Key_Backspace)
+    assert lib.filter.text() == "a" and svc.has_entry(entry_id)
+    lib.filter.clear()
+
+    lib.photos.setFocus()                                              # the album: the selected photo
+    lib.photos.setCurrentRow(1)
+    qtbot.keyClick(lib.photos, Qt.Key.Key_Backspace)
+    assert len(svc.get_entry(entry_id).photos) == n_photos - 1
+    lib.list.setFocus()                                                # the list: the selected entry
+    qtbot.keyClick(lib.list, Qt.Key.Key_Delete)
+    assert not svc.has_entry(entry_id)
+
+    run_search(ready, qtbot, held_out(people, 1)[1])
+    ready.nav.setCurrentRow(1)                                         # History: the selected record
+    qtbot.waitUntil(lambda: ready.history.list.count() == 1, timeout=5000)
+    ready.history.list.setCurrentRow(0)
+    ready.history.list.setFocus()
+    qtbot.keyClick(ready.history.list, Qt.Key.Key_Backspace)
+    assert svc.list_history() == []
+
+    ready.nav.setCurrentRow(3)                                         # Trash: for good, after asking
+    tree = ready.trash.tree
+    qtbot.waitUntil(lambda: tree.topLevelItemCount() == 3, timeout=5000)
+    tree.topLevelItem(0).setSelected(True)
+    tree.setFocus()
+    qtbot.keyClick(tree, Qt.Key.Key_Backspace)
+    assert len(svc.list_trash()) == 2
+    assert [a.text() for a in ready.menuBar().actions()[0].menu().actions()].count("Delete") == 1
+
+
+def test_esc_keeps_the_old_text_and_a_click_elsewhere_saves(ready, qtbot):
+    lib = open_entry(ready)
+    entry_id, name = lib.entry.id, lib.entry.name
+    type_inline(qtbot, lib.title, "Somebody else", finish="esc")
+    assert ready.service.get_entry(entry_id).name == name and lib.title.label.text() == name
+    open_inline(qtbot, lib.title)                                       # an entry needs a name:
+    lib.title.editor.setText("")
+    qtbot.keyClick(lib.title.editor, Qt.Key.Key_Return)
+    assert lib.title.editing                                            # Enter keeps the box open
+    qtbot.keyClick(lib.title.editor, Qt.Key.Key_Escape)
+    assert not lib.title.editing and ready.service.get_entry(entry_id).name == name
+    type_inline(qtbot, lib.tags_text, "friend，tennis", finish="click")
+    assert ready.service.get_entry(entry_id).tags == ["friend", "tennis"]
+    assert lib.tags_text.label.text() == "friend  ·  tennis"
+    item = next(lib.list.item(i) for i in range(lib.list.count()) if lib.list.item(i).data(library_page.ROLE_ID)
+                == entry_id)
+    type_inline(qtbot, lib.title, name + " Jr.")
+    assert item.text().startswith(name + " Jr.")                       # the list follows at once
 
 
 def test_drag_maths_inserts_and_swaps():
@@ -640,10 +924,17 @@ def test_drag_maths_inserts_and_swaps():
     assert PhotoGrid.new_order(ids, 1, "swap", 1) == ids
 
 
+def test_merged_order_keeps_photos_added_or_removed_since():
+    from facedict.gui.undo import merged_order
+    assert merged_order(["a", "b", "c"], ["c", "a", "b"]) == ["c", "a", "b"]
+    assert merged_order(["a", "b", "c", "d"], ["c", "a", "b"]) == ["c", "a", "b", "d"]    # d is new
+    assert merged_order(["a", "c"], ["c", "b", "a"]) == ["c", "a"]                      # b is gone
+
+
 def test_dropping_on_a_photo_swaps_between_photos_inserts(ready, qtbot):
     lib = open_entry(ready)
-    lib.edit_btn.click()
     grid = lib.photos
+    assert grid.dragEnabled()                                   # no edit mode to switch on first
     qtbot.waitUntil(lambda: grid.count() > 2 and grid.visualRect(grid.indexFromItem(grid.item(1))).width() > 0,
                     timeout=5000)
     rect = grid.visualRect(grid.indexFromItem(grid.item(1)))
@@ -654,65 +945,126 @@ def test_dropping_on_a_photo_swaps_between_photos_inserts(ready, qtbot):
     assert grid.target_at(far)[0] == "insert"
 
 
-def test_photos_can_be_reordered_in_edit_mode(ready, qtbot):
+def test_reordering_photos_is_saved_at_once_and_undone_with_cmd_z(ready, qtbot):
     from facedict.gui.library_page import PhotoGrid
     lib = open_entry(ready)
-    assert not lib.photos.dragEnabled()                      # read-only page: no accidental dragging
-    lib.edit_btn.click()
-    assert lib.photos.dragEnabled()
+    entry_id = lib.entry.id
     ids = [p.photo_id for p in lib.entry.photos]
-    assert lib.photos.item(0).text() == "cover"
+    assert all(lib.photos.item(i).text() == "" for i in range(lib.photos.count()))     # no captions
+    assert lib.photos.item(0).data(library_page.ROLE_COVER) and not lib.photos.item(1).data(library_page.ROLE_COVER)
 
     lib.photos.reordered.emit(PhotoGrid.new_order(ids, 2, "insert", 1))
-    assert [p.photo_id for p in lib.entry.photos][:3] == [ids[0], ids[2], ids[1]]
-    assert lib.editing and lib.has_unsaved_changes           # stays in edit mode, pending until saved
-    assert ready.service.get_entry(lib.entry.id).cover.photo_id == ids[0]
-
+    assert [p.photo_id for p in ready.service.get_entry(entry_id).photos][:3] == [ids[0], ids[2], ids[1]]
     lib.photos.reordered.emit(PhotoGrid.new_order(lib.photos.ids(), 0, "swap", len(ids) - 1))
-    lib.save_btn.click()
-    saved = [p.photo_id for p in ready.service.get_entry(lib.entry.id).photos]
-    assert saved[0] == ids[-1] and saved[-1] == ids[0]
-    assert not lib.editing
+    saved = [p.photo_id for p in ready.service.get_entry(entry_id).photos]
+    assert saved[0] == ids[-1] and saved[-1] == ids[0]                          # a new cover, right away
+    assert lib.photos.ids() == saved
+
+    assert ready.undo_action.text() == "Undo Reorder Photos"
+    ready.undo_action.trigger()
+    ready.undo_action.trigger()
+    assert [p.photo_id for p in ready.service.get_entry(entry_id).photos] == ids
+    assert lib.photos.ids() == ids and not ready.undo_action.isEnabled()
+    ready.redo_action.trigger()
+    assert [p.photo_id for p in ready.service.get_entry(entry_id).photos][:3] == [ids[0], ids[2], ids[1]]
 
 
-def test_discarding_puts_the_photo_order_back(ready, qtbot):
-    from facedict.gui.library_page import PhotoGrid
+def test_new_photos_show_up_at_once_and_undo_moves_them_to_the_trash(ready, qtbot, people):
     lib = open_entry(ready)
-    lib.edit_btn.click()
-    ids = [p.photo_id for p in lib.entry.photos]
-    lib.photos.reordered.emit(PhotoGrid.new_order(ids, 0, "insert", len(ids)))
-    assert [p.photo_id for p in lib.entry.photos][0] == ids[1]
-    lib.cancel_btn.click()
-    assert not lib.editing and [p.photo_id for p in lib.entry.photos] == ids
-    assert ready.service.get_entry(lib.entry.id).cover.photo_id == ids[0]
+    name = lib.entry.name.replace(" ", "_")
+    before = lib.photos.count()
+    lib.add_photo_files(lib.entry.id, [people[name][-1]])                # the held-out photo
+    qtbot.waitUntil(lambda: lib.photos.count() == before + 1, timeout=20000)
+    assert lib.photos_title.text() == f"Photos ({before + 1})"
+    idle(ready, qtbot)
+    assert ready.undo_action.text() == "Undo Add Photo"
+    ready.undo_action.trigger()
+    assert lib.photos.count() == before
+    assert [i.kind for i in ready.service.list_trash()] == ["photo"]      # never deleted for good
+    ready.redo_action.trigger()
+    assert lib.photos.count() == before + 1 and ready.service.list_trash() == []
 
 
-# --- read-only photos, any script, selectable text ---------------------------------------------------
+def test_a_new_entry_shows_its_cover_at_once(ready, qtbot, people, monkeypatch):
+    monkeypatch.setattr(library_page.QInputDialog, "getText", lambda *a, **k: ("Someone New", True))
+    lib = open_entry(ready)
+    lib.new_entry()
+    assert lib.entry.name == "Someone New" and lib.photos.count() == 0
+    lib.add_photo_files(lib.entry.id, [list(people.values())[0][-1]])
+    qtbot.waitUntil(lambda: lib.photos.count() == 1, timeout=20000)
+    item = lib.list.currentItem()
+    assert item.text().startswith("Someone New") and "1 photo" in item.text()
 
-def test_photo_faces_cannot_be_changed_outside_edit_mode(ready, qtbot, group):
+
+def test_undo_steps_back_through_every_kind_of_change(ready, qtbot, monkeypatch):
+    """⌘Z again and again walks back through the changes, across entries; ⇧⌘Z walks forward; a new
+    change after an undo drops the steps that were undone."""
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(library_page.QInputDialog, "getText", lambda *a, **k: ("Fresh Person", True))
+    svc = ready.service
+    lib = open_entry(ready, 0)
+    first, first_name = lib.entry.id, lib.entry.name
+    n_entries = len(svc.list_entries())
+    type_inline(qtbot, lib.title, "Renamed")                                      # 1 text
+    lib.photos.setCurrentRow(1)
+    removed = lib._current_photo().photo_id
+    lib.remove_photo()                                                            # 2 photo to the Trash
+    lib.new_entry()                                                               # 3 a new entry
+    fresh = lib.entry.id
+    type_inline(qtbot, lib.tags_text, "new")                                      # 4 text of the new entry
+    second = next(e.id for e in svc.list_entries() if e.id not in (first, fresh))
+    lib.select_entry(second)
+    assert lib.entry.id == second
+    lib.delete_entry()                                                            # 5 an entry to the Trash
+    assert ready.undo_action.text() == "Undo Delete Entry" and lib.undo_stack.count() == 5
+
+    ready.nav.setCurrentRow(0)                                     # undo from another page shows the Library
+    ready.undo_action.trigger()
+    assert ready.page_stack.currentWidget() is lib and svc.has_entry(second) and lib.entry.id == second
+    ready.undo_action.trigger()
+    assert svc.get_entry(fresh).tags == [] and lib.entry.id == fresh               # shows the entry it changes
+    ready.undo_action.trigger()
+    assert not svc.has_entry(fresh) and len(svc.list_entries()) == n_entries
+    ready.undo_action.trigger()
+    assert svc.get_entry(first).photo(removed) is not None
+    assert [p.photo_id for p in svc.get_entry(first).photos][1] == removed        # in its old place
+    ready.undo_action.trigger()
+    assert svc.get_entry(first).name == first_name and lib.title.text == first_name
+    assert not ready.undo_action.isEnabled() and ready.redo_action.text() == "Redo Edit Name"
+
+    for _ in range(3):
+        ready.redo_action.trigger()
+    assert svc.get_entry(first).name == "Renamed" and svc.has_entry(fresh)
+    assert svc.get_entry(first).photo(removed) is None
+    type_inline(qtbot, lib.title, "Fresh")                         # a new change: no more redo
+    assert not ready.redo_action.isEnabled() and lib.undo_stack.count() == 4
+
+
+def test_undo_says_so_when_the_trash_was_emptied(ready, qtbot, monkeypatch):
+    monkeypatch.setattr(library_page, "confirm", lambda *a, **k: True)
+    warnings = []
+    monkeypatch.setattr(library_page.QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
+    lib = open_entry(ready)
+    entry_id = lib.entry.id
+    lib.delete_entry()
+    for item in ready.service.list_trash():
+        ready.service.purge(item.id)                               # “Delete permanently” on the Trash page
+    ready.undo_action.trigger()
+    assert warnings and "no longer in the Trash" in warnings[0]
+    assert not ready.service.has_entry(entry_id) and lib.undo_stack.count() == 0
+
+
+def test_photo_dialog_offers_no_choice_for_a_photo_with_one_face(ready, qtbot):
     from facedict.gui.library_page import PhotoDialog
-    data, expected = group
-    entry = ready.service.get_entry(expected[1])
-    res = ready.service.add_photo(entry.id, data)
-    img, faces = ready.service.detect_faces(res.photo.photo_id)
-    before = ready.service.get_entry(entry.id).photo(res.photo.photo_id).face
+    entry, ref = next((e, r) for e in ready.service.list_entries() for r in e.photos
+                      if r.face_count == 1 and r.face is not None)
+    img, faces = ready.service.detect_faces(ref.photo_id)
+    dlg = PhotoDialog(ready.service, ready.runner, entry.id, ref, img, faces, ready)
+    qtbot.addWidget(dlg)
+    assert len(faces) == 1 and not dlg.view.image.interactive
 
-    view_only = PhotoDialog(ready.service, ready.runner, entry.id, res.photo, img, faces, False, ready)
-    qtbot.addWidget(view_only)
-    view_only.show()
-    qtbot.waitExposed(view_only)
-    assert not view_only.view.image.interactive and view_only.view.image.face_count == len(faces)
-    click_face(qtbot, view_only.view.image, 0)
-    qtbot.wait(200)
-    assert ready.service.get_entry(entry.id).photo(res.photo.photo_id).face == before
-    assert "edit the entry" in view_only.status.text()
 
-    editable = PhotoDialog(ready.service, ready.runner, entry.id, res.photo, img, faces, True, ready)
-    qtbot.addWidget(editable)
-    editable.show()
-    qtbot.waitExposed(editable)
-    assert editable.view.image.interactive
-
+# --- any script, selectable text ----------------------------------------------------------------------
 
 def test_entries_in_any_script(ready, qtbot):
     svc = ready.service
@@ -727,12 +1079,10 @@ def test_entries_in_any_script(ready, qtbot):
     assert [e.id for e in svc.search_entries("东京", scope=field.id)] == [han.id]
     assert [e.id for e in svc.search_entries("ＺＨＡＮＧ")] == [han.id]       # full-width matches half-width
     lib = open_entry(ready)
+    lib.refresh()
     lib.select_entry(han.id)
-    assert lib.title.text() == "张三"
-    lib.edit_btn.click()
-    lib.tags.setText("同事，北京")                    # QTest cannot type CJK, so set it (an IME would type it)
-    lib.tags.textEdited.emit(lib.tags.text())        # a Chinese comma separates values too
-    lib.save_btn.click()
+    assert lib.title.text == "张三" and lib._rows[("field", field.id)].value.text == "在东京认识的"
+    type_inline(qtbot, lib.tags_text, "同事，北京")       # a Chinese comma separates values too
     assert svc.get_entry(han.id).tags == ["同事", "北京"]
 
 
@@ -740,7 +1090,7 @@ def test_text_can_be_selected_and_copied(ready, qtbot):
     from PySide6.QtGui import QGuiApplication
     lib = open_entry(ready)
     qtbot.wait(100)
-    assert lib.title.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+    assert lib.title.label.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
     assert ready.stats.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
     QGuiApplication.clipboard().clear()
     copy_action = next(a for a in lib.list.actions() if a.text() == "Copy")

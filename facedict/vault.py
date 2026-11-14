@@ -573,6 +573,11 @@ class Vault:
         self._check_id("trash", trash_id)
         return self.root / TRASH / trash_id
 
+    def has_trash(self, trash_id: str) -> bool:
+        with self._lock:
+            self._require_key()
+            return bool(_ID_RE.match(trash_id)) and (self.root / TRASH / trash_id / MANIFEST).exists()
+
     def _begin_trash(self, item: TrashItem, rels: list[str]) -> Path:
         """Create the trash folder and write its manifest before anything is moved."""
         tdir = self._trash_dir(item.id)

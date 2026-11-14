@@ -43,8 +43,7 @@ class ResultCard(QFrame):
         self.name_label = ClickableLabel(title, "Open this entry")
         name = self.name_label
         f = name.font()
-        f.setPointSize(14)
-        f.setBold(True)
+        f.setPointSize(15)
         name.setFont(f)
         for w in (pic, name):
             w.clicked.connect(lambda: self.open_clicked.emit(self.entry_id))
@@ -117,7 +116,7 @@ class ResultsPanel(QWidget):
         self.banner.setObjectName("banner")
         self.banner.setWordWrap(True)
         self.banner.setVisible(False)
-        self.empty = muted("Results appear here.")
+        self.empty = muted()
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.list = QVBoxLayout()
         self.list.setSpacing(8)
@@ -140,7 +139,7 @@ class ResultsPanel(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumWidth(370)
 
-    def clear(self, message: str = "Results appear here.") -> None:
+    def clear(self, message: str = "") -> None:
         self.record = None
         self.face_index = 0
         self.caption.setVisible(False)

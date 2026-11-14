@@ -65,6 +65,7 @@ class PhotoRef:
     face_count: int = 1                # faces detected when the photo was added
     source: str = "import"             # "import" | "query:<history_id>#<face index>"
     added_at: str = field(default_factory=now_iso)
+    note: str = ""                     # the user's own words about this photo
 
     @property
     def from_query(self) -> str | None:
@@ -82,13 +83,14 @@ class PhotoRef:
     def to_dict(self) -> dict:
         return {"photo_id": self.photo_id, "sha256": self.sha256,
                 "face": self.face.to_dict() if self.face else None,
-                "face_count": self.face_count, "source": self.source, "added_at": self.added_at}
+                "face_count": self.face_count, "source": self.source, "added_at": self.added_at,
+                "note": self.note}
 
     @classmethod
     def from_dict(cls, d: dict) -> "PhotoRef":
         return cls(photo_id=d["photo_id"], sha256=d["sha256"], face=Face.from_dict(d.get("face")),
                    face_count=int(d.get("face_count", 1)), source=d.get("source", "import"),
-                   added_at=d.get("added_at", now_iso()))
+                   added_at=d.get("added_at", now_iso()), note=str(d.get("note", "")))
 
 
 @dataclass

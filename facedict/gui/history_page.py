@@ -10,8 +10,8 @@ from PySide6.QtWidgets import (QHBoxLayout, QListWidget, QListWidgetItem, QPushB
                                QWidget)
 
 from .. import config
-from .common import (add_copy_action, bytes_to_pixmap, confirm, header_row, heading, icon_button, muted,
-                     placeholder_pixmap)
+from .common import (GAP, GUTTER, PAGE_MARGIN, add_copy_action, bytes_to_pixmap, confirm, has_focus_in,
+                     header_row, heading, icon_button, muted, placeholder_pixmap)
 from .faces_view import QueryView, render_photo
 from .results import ResultsPanel
 
@@ -46,7 +46,7 @@ class HistoryPage(QWidget):
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
-        ll.setSpacing(6)
+        ll.setSpacing(GAP)
         ll.addWidget(header_row("History", self.count))
         ll.addWidget(self.list, 1)
 
@@ -58,7 +58,7 @@ class HistoryPage(QWidget):
         self.rerun_btn = QPushButton("Search again")
         self.rerun_btn.setToolTip("Search this photo again with the library as it is now")
         self.rerun_btn.clicked.connect(self._rerun)
-        self.delete_btn = icon_button("🗑", "Move this search record to the Trash")
+        self.delete_btn = icon_button("trash", "Move this search record to the Trash")
         self.delete_btn.clicked.connect(self._delete)
         detail = QWidget()
         dl = QHBoxLayout(detail)
@@ -68,7 +68,7 @@ class HistoryPage(QWidget):
         right = QWidget()
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(6)
+        rl.setSpacing(GAP)
         self.title = heading("", 15)
         self.header = header_row("", self.rerun_btn, self.delete_btn)
         self.header.layout().insertWidget(0, self.title)
@@ -76,6 +76,7 @@ class HistoryPage(QWidget):
         rl.addWidget(detail, 1)
 
         split = QSplitter()
+        split.setHandleWidth(GUTTER)
         split.addWidget(left)
         split.addWidget(right)
         split.setStretchFactor(0, 2)
@@ -83,7 +84,7 @@ class HistoryPage(QWidget):
         split.setChildrenCollapsible(False)
         split.setSizes([280, 980])
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
         lay.addWidget(split)
         self._show_detail(False)
 
@@ -206,6 +207,12 @@ class HistoryPage(QWidget):
             self.service.delete_history(hid)
             self.refresh()
             self.changed.emit(hid)
+
+    def delete_target(self, focus):
+        """What ⌫ deletes: the selected search record."""
+        if has_focus_in(self.list, focus) and self._current_id():
+            return self._delete
+        return None
 
     def clear(self) -> None:
         self.list.clear()

@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel, QLine
                                QWidget)
 
 from .. import config
-from .common import Runner, default_error_handler, header_row, icon_button, make_labels_selectable
+from .common import GAP, PAGE_MARGIN, Runner, default_error_handler, header_row, icon_button, make_labels_selectable
 from .history_page import HistoryPage
 from .library_page import LibraryPage
 from .lock_screen import LockScreen
@@ -81,9 +81,9 @@ class MainWindow(QMainWindow):
             self.page_stack.addWidget(p)
         self.nav.currentRowChanged.connect(self._switch_page)
 
-        settings_btn = icon_button("⚙", "Settings")
+        settings_btn = icon_button("settings", "Settings")
         settings_btn.clicked.connect(self.open_settings)
-        lock_btn = icon_button("🔒", "Lock now (⌘L)")
+        lock_btn = icon_button("lock", "Lock now (⌘L)")
         lock_btn.clicked.connect(lambda: self.lock())
         tools = QHBoxLayout()
         tools.addWidget(settings_btn)
@@ -91,8 +91,8 @@ class MainWindow(QMainWindow):
         tools.addStretch(1)
         side = QWidget()
         sl = QVBoxLayout(side)
-        sl.setContentsMargins(8, 16, 8, 16)
-        sl.setSpacing(6)
+        sl.setContentsMargins(8, PAGE_MARGIN, 8, PAGE_MARGIN)          # headers line up with the pages
+        sl.setSpacing(GAP)
         sl.addWidget(header_row("FaceDictionary", size=15))     # same height as every page header
         sl.addWidget(self.nav, 1)
         sl.addLayout(tools)
@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
         self.search.changed.connect(lambda h: self._changed(except_page="Search", history_id=h))
         self.history.changed.connect(lambda h: self._changed(except_page="History", history_id=h))
         self.library.changed.connect(lambda: self._changed(except_page="Library"))
+        self.library.reveal.connect(lambda: self._goto(2))
         self.trash.changed.connect(lambda: self._changed(except_page="Trash"))
 
         self._actions()
@@ -150,6 +151,42 @@ class MainWindow(QMainWindow):
         add("New entry", "Ctrl+N", self._new_entry_shortcut)
         for i in range(len(PAGES)):
             add(PAGES[i], f"Ctrl+{i + 1}", lambda _c=False, i=i: self._goto(i))
+        self._edit_menu()
+
+    def _edit_menu(self) -> None:
+        """Edit › Undo / Redo (⌘Z / ⇧⌘Z) for every change made in the Library, step after step.
+        Inside a text box that is open, the keys undo the typing instead, as everywhere on the Mac."""
+        stack = self.library.undo_stack
+        self.undo_action = QAction("Undo", self)
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_action.triggered.connect(self.library.undo)
+        self.redo_action = QAction("Redo", self)
+        self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.redo_action.triggered.connect(self.library.redo)
+
+        def sync(*_args) -> None:
+            self.undo_action.setEnabled(stack.canUndo())
+            self.undo_action.setText(f"Undo {stack.undoText()}" if stack.canUndo() else "Undo")
+            self.redo_action.setEnabled(stack.canRedo())
+            self.redo_action.setText(f"Redo {stack.redoText()}" if stack.canRedo() else "Redo")
+
+        for signal in (stack.indexChanged, stack.canUndoChanged, stack.canRedoChanged, stack.undoTextChanged,
+                       stack.redoTextChanged):
+            signal.connect(sync)
+        sync()
+        menu = self.menuBar().addMenu("Edit")
+        menu.addAction(self.undo_action)
+        menu.addAction(self.redo_action)
+        self.delete_action = QAction("Delete", self)
+        self.delete_action.setShortcuts([QKeySequence(Qt.Key.Key_Backspace), QKeySequence(Qt.Key.Key_Delete)])
+        self.delete_action.triggered.connect(self._delete_shortcut)
+        self.addAction(self.delete_action)
+        menu.addSeparator()
+        menu.addAction(self.delete_action)
+        menu.addSeparator()
+        for action in self.library.add_actions.values():
+            menu.addAction(action)
+            self.addAction(action)
 
     def _workspace_active(self) -> bool:
         return self.service.unlocked and self.stack.currentIndex() == 1
@@ -159,9 +196,26 @@ class MainWindow(QMainWindow):
             self.nav.setCurrentRow(index)
 
     def _open_shortcut(self) -> None:
-        if self._workspace_active():
-            self._goto(0)
-            self.search.open_photo()
+        """⌘O: photos for the entry shown in the Library; anywhere else, a photo to search."""
+        if not self._workspace_active():
+            return
+        if self.page_stack.currentWidget() is self.library and self.library.entry is not None:
+            self.library.add_photos()
+            return
+        self._goto(0)
+        self.search.open_photo()
+
+    def _delete_shortcut(self) -> None:
+        """⌫ / ⌦ on every page: delete what is selected in the list or album that has the keyboard
+        focus, the same way its delete button does. Text boxes keep the keys for typing."""
+        if not self._workspace_active():
+            return
+        page = self.page_stack.currentWidget()
+        target = page.delete_target(QApplication.focusWidget()) if hasattr(page, "delete_target") else None
+        if target is None:
+            QApplication.beep()
+            return
+        target()
 
     def _paste_shortcut(self) -> None:
         focus = QApplication.focusWidget()
@@ -208,7 +262,7 @@ class MainWindow(QMainWindow):
                 self.search.results.show_record(self.service.get_history(history_id), self.search.results.face_index)
             except Exception:
                 self.search.results.clear()
-        self._update_stats()
+        self._update_status()
 
     def open_entry(self, entry_id: str) -> None:
         self.nav.setCurrentRow(2)
@@ -240,7 +294,7 @@ class MainWindow(QMainWindow):
         def progress(done, total):
             self.stats.setText(f"Preparing the face index… {done}/{total}")
 
-        self.runner.submit(lambda p, c: self.service.ensure_index(p, c), on_done=lambda _r: self._update_stats(),
+        self.runner.submit(lambda p, c: self.service.ensure_index(p, c), on_done=lambda _r: self._update_status(),
                            on_progress=progress, with_progress=True)
 
     def _setup_questions(self, password: str) -> None:
@@ -251,11 +305,10 @@ class MainWindow(QMainWindow):
     def lock(self, reason: str = "") -> None:
         if not self.service.unlocked:
             return
-        if self.library.has_unsaved_changes:
-            try:
-                self.library.save()                        # never lose edits to an auto-lock
-            except Exception:
-                pass
+        try:
+            self.library.commit_edits()                    # never lose what is being typed to an auto-lock
+        except Exception:
+            pass
         for w in QApplication.topLevelWidgets():         # close dialogs that may show personal data
             if isinstance(w, QDialog) and w.isVisible():
                 w.done(QDialog.DialogCode.Rejected)
@@ -273,17 +326,13 @@ class MainWindow(QMainWindow):
         self.busy.setRange(0, 0)
         self.busy.setVisible(busy)
 
-    def _update_stats(self) -> None:
+    def _update_status(self) -> None:
+        """The status bar stays empty unless something needs attention."""
         if not self.service.unlocked:
             return
-        s = self.service.stats()
-        spec = config.MODELS.get(s["model"])
-        text = (f"{s['entries']} entries · {s['photos']} photos · {s['indexed']} faces indexed · "
-                f"{s['history']} searches · model: {spec.label if spec else s['model']}")
         bad = len(self.service.vault.unreadable)
-        if bad:
-            text += f"   ⚠ {bad} file(s) could not be read – see Settings › Check database integrity"
-        self.stats.setText(f"{self.service.vault_name}   ·   {text}")
+        self.stats.setText(f"⚠ {bad} file(s) could not be read – see Settings › Check database integrity"
+                           if bad else "")
 
     def open_settings(self) -> None:
         if not self.service.unlocked:
@@ -303,7 +352,7 @@ class MainWindow(QMainWindow):
 
             def finished(_r):
                 progress.close()
-                self._update_stats()
+                self._update_status()
 
             def failed(exc):
                 progress.close()

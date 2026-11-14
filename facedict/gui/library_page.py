@@ -1,36 +1,82 @@
-"""Library page: the list of entries, an entry's page (read-only, or in edit mode), and its album."""
+"""Library page: the list of entries, and one entry's page with its album.
+
+There is no edit mode. Text reads like a label; double-click it to change it (a click is enough where
+nothing is written yet), and click elsewhere to save. Photos are added, removed, reordered and switched
+off right away. Every change can be undone with ⌘Z, step after step (see undo.py).
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QIcon, QPainter, QPen
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence, QPainter,
+                           QPalette, QPen, QTextCursor, QUndoStack)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QListWidget,
-                               QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton,
-                               QRadioButton, QScrollArea, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
+                               QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog,
+                               QScrollArea, QSplitter, QToolTip, QVBoxLayout, QWidget)
 
 from ..engine import iou, reading_order
+from ..imageio import is_supported
 from ..models import Entry, Face, OwnField, fold, split_values
 from ..service import SCOPE_ALL, SCOPE_NAME, SCOPE_TAGS, haystacks
-from .common import (ElidedLabel, add_copy_action, bytes_to_pixmap, choose_folder, confirm,
-                     default_error_handler, divider, header_row, heading, icon_button, make_labels_selectable,
-                     mark_excluded, muted, open_images, placeholder_pixmap)
+from . import undo
+from .common import (GAP, GUTTER, PAGE_MARGIN, ElidedLabel, add_copy_action, bytes_to_pixmap, choose_folder,
+                     confirm, default_error_handler, divider, has_focus_in, header_row, semibold, icon_button, make_selectable, mark_cover, mark_excluded, muted, open_images,
+                     placeholder_pixmap)
 from .faces_view import QueryView, render_photo
 from .history_page import fmt_time
 
 ROLE_ID = Qt.ItemDataRole.UserRole
 ROLE_SEARCH = Qt.ItemDataRole.UserRole + 1
+ROLE_COVER = Qt.ItemDataRole.UserRole + 2
 PHOTO_ICON = 116
 LABEL_WIDTH = 110
+UNDO_LIMIT = 100
 
 
-def split_list(text: str) -> list[str]:
-    return split_values(text)
+def dotted(text: str) -> str:
+    return "  ·  ".join(split_values(text))
+
+
+def repolish(widget: QWidget) -> None:
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+    widget.update()
 
 
 # --- small widgets -------------------------------------------------------------------------------
+
+def exec_menu(menu: QMenu, at: QPoint):
+    return menu.exec(at)
+
+
+def run_menu(menu_items: list, at: QPoint, parent: QWidget, marked=None) -> None:
+    """Show a right-click menu of (title, callback) pairs (None: a separator). The chosen callback runs
+    after the menu has closed, so it may safely rebuild the widgets the menu was opened on.
+    `marked(on)` marks the place the menu belongs to while it is open."""
+    menu = QMenu(parent)
+    chosen = {}
+    for item in menu_items:
+        if item is None:
+            menu.addSeparator()
+        else:
+            chosen[menu.addAction(item[0])] = item[1]
+    if marked is not None:
+        marked(True)
+    try:
+        action = exec_menu(menu, at)
+    finally:
+        if marked is not None:
+            try:
+                marked(False)
+            except RuntimeError:                 # the row went away meanwhile (the app locked, …)
+                pass
+    if action in chosen:
+        QTimer.singleShot(0, chosen[action])
+
+
 
 class GrowingTextEdit(QPlainTextEdit):
     """A text box one line tall that grows with its content, up to `max_lines`, then scrolls."""
@@ -56,49 +102,260 @@ class GrowingTextEdit(QPlainTextEdit):
         self._sync_height()
 
 
-class FieldRow(QWidget):
-    """One row of an entry's page: the field's name on the left, its text on the right."""
+class InlineText(QWidget):
+    """Text that reads like a label and becomes a text box when double-clicked (a single click is
+    enough while it is empty). Enter, Tab or a click anywhere else saves – ⌘Enter where the text can
+    have several lines, since Enter starts a new line there; Esc puts the old text back."""
 
-    remove_clicked = Signal()
+    committed = Signal(str)                # the new text, only when it changed
+    started = Signal()
+    finished = Signal()
 
-    def __init__(self, name: str, value: str, personal: bool, editable: bool, parent=None):
+    def __init__(self, text: str = "", *, multiline: bool = False, placeholder: str = "", hint: str = "",
+                 display=None, label: QLabel | None = None, font: QFont | None = None, wrap: bool = True,
+                 parent=None):
         super().__init__(parent)
+        self.text = text
+        self.multiline = multiline
+        self.placeholder = placeholder     # shown, dimmed, while there is no text
+        self.display = display             # text -> what the label shows (None: the text as it is)
+        self.validate = None               # text -> a problem to point out, or None
+        self.menu_actions: list = []              # more (title, callback) pairs for the menu, None: a separator
+        self.on_menu = None                        # on_menu(True/False) while its right-click menu is open
+        self.editing = False
+        self.by_key = False                # the last edit ended with Enter or Tab (not a click)
+        self._dim = False
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+
+        self.label = label if label is not None else QLabel()
+        self.label.setProperty("inline", True)
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
+        self.label.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)     # ours: contextMenuEvent
+        self.label.setAlignment(Qt.AlignmentFlag.AlignLeft | (Qt.AlignmentFlag.AlignTop if multiline
+                                                              else Qt.AlignmentFlag.AlignVCenter))
+        if not isinstance(self.label, ElidedLabel):
+            self.label.setWordWrap(wrap)
+        make_selectable(self.label)                # a single click still selects text to copy
+        self.editor = GrowingTextEdit() if multiline else QLineEdit()
+        if multiline:
+            self.editor.setTabChangesFocus(True)
+        if hint:
+            self.editor.setPlaceholderText(hint)
+        if font is not None:
+            self.label.setFont(font)
+            self.editor.setFont(font)
+        self.editor.hide()
+        self.label.installEventFilter(self)
+        self.editor.installEventFilter(self)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.label)
+        lay.addWidget(self.editor)
+        self._show()
+
+    # --- what it shows --------------------------------------------------------------------------
+
+    def set_text(self, text: str) -> None:
+        self.text = text
+        if not self.editing:
+            self._show()
+
+    def set_dim(self, dim: bool) -> None:
+        self._dim = dim
+        self._show()
+
+    @property
+    def empty(self) -> bool:
+        return not self.text.strip()
+
+    def _show(self) -> None:
+        shown = self.display(self.text) if self.display and not self.empty else self.text
+        self.label.setText(self.placeholder if self.empty else shown)
+        self._set_flag("empty", self.empty or self._dim)
+
+    def _set_flag(self, name: str, on: bool) -> None:
+        if bool(self.label.property(name)) != on:
+            self.label.setProperty(name, on)
+            repolish(self.label)
+
+    # --- editing ----------------------------------------------------------------------------------
+
+    def start_edit(self, at: QPoint | None = None) -> None:
+        """Open the text box; `at` (global) puts the cursor where the user double-clicked."""
+        if self.editing:
+            return
+        self.editing = True
+        self.by_key = False
+        if self.multiline:
+            self.editor.setPlainText(self.text)
+        else:
+            self.editor.setText(self.text)
+        self.label.hide()
+        self.editor.show()
+        self.layout().activate()
+        self.editor.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._place_cursor(at)
+        QApplication.instance().installEventFilter(self)          # a click anywhere else saves
+        self.started.emit()
+
+    def _place_cursor(self, at: QPoint | None) -> None:
+        if at is None or self.display is not None:               # the label shows other text: go to the end
+            if self.multiline:
+                self.editor.moveCursor(QTextCursor.MoveOperation.End)
+            else:
+                self.editor.end(False)
+            return
+        if self.multiline:
+            self.editor.setTextCursor(self.editor.cursorForPosition(self.editor.viewport().mapFromGlobal(at)))
+        else:
+            self.editor.setCursorPosition(self.editor.cursorPositionAt(self.editor.mapFromGlobal(at)))
+
+    def current(self) -> str:
+        return (self.editor.toPlainText() if self.multiline else self.editor.text()).strip()
+
+    def finish(self, save: bool = True, by_key: bool = False) -> bool:
+        """Close the text box, saving (or not) what it says. False: the text has a problem and Enter
+        was pressed, so the box stays open to fix it."""
+        if not self.editing:
+            return True
+        new = self.current()
+        changed = save and new != self.text.strip()
+        if changed and self.validate is not None:
+            problem = self.validate(new)
+            if problem:
+                where = self.editor.mapToGlobal(QPoint(0, self.editor.height()))
+                if by_key:
+                    QToolTip.showText(where, problem, self.editor)
+                    return False
+                QToolTip.showText(where, f"{problem} The old text was kept.", self)
+                changed = False
+        self.editing = False
+        self.by_key = by_key
+        QApplication.instance().removeEventFilter(self)
+        if self.editor.hasFocus():
+            self.setFocus(Qt.FocusReason.OtherFocusReason)        # not on to some other text box
+        self.editor.hide()
+        self.label.show()
+        if changed:
+            self.committed.emit(new)
+        self.finished.emit()
+        return True
+
+    # --- events -------------------------------------------------------------------------------------
+
+    def eventFilter(self, obj, event) -> bool:
+        kind = event.type()
+        if obj is self.label:
+            if event.type() == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
+                self.start_edit(event.globalPosition().toPoint())
+                return True
+            if (kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton
+                    and self.empty):
+                self.start_edit()
+                return True
+            return False
+        if not self.editing:
+            return False
+        if obj is self.editor:
+            if kind == QEvent.Type.KeyPress:
+                key = event.key()
+                if key == Qt.Key.Key_Escape:
+                    self.finish(False)
+                    return True
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    command = event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                                   | Qt.KeyboardModifier.MetaModifier)
+                    if not self.multiline or command:
+                        self.finish(True, by_key=True)
+                        return True
+                if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+                    self.by_key = True
+            elif kind == QEvent.Type.FocusOut:
+                if event.reason() not in (Qt.FocusReason.ActiveWindowFocusReason, Qt.FocusReason.PopupFocusReason):
+                    self.finish(True, by_key=self.by_key)
+            return False
+        if kind == QEvent.Type.MouseButtonPress and isinstance(obj, QWidget):
+            inside = obj is self.editor or self.editor.isAncestorOf(obj)
+            if not inside and not isinstance(obj.window(), QMenu):
+                self.finish(True)
+        return False
+
+    def contextMenuEvent(self, event) -> None:
+        if self.editing:
+            return super().contextMenuEvent(event)
+        items = []
+        if not self.empty:
+            selected = self.label.selectedText() if self.label.hasSelectedText() else ""
+            text = selected or self.text
+            items.append(("Copy", lambda: QGuiApplication.clipboard().setText(text)))
+        items.append(("Add…" if self.empty else "Edit…", lambda: self.start_edit()))
+        items += self.menu_actions
+        run_menu(items, event.globalPos(), self, self.on_menu)
+
+
+class FieldRow(QWidget):
+    """One field of an entry: its name on the left, its text on the right, both edited in place.
+    While its right-click menu is open, the row is marked, so it is clear which field the menu is for."""
+
+    def __init__(self, name: str, value: str, personal: bool, parent=None):
+        super().__init__(parent)
+        self.personal = personal
+        self.created = False                       # a new row: set once the field exists
         self.field_name = name
-        label = QLabel(name)
-        label.setWordWrap(True)
-        label.setFixedWidth(LABEL_WIDTH)
-        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        f = label.font()
-        f.setBold(True)
-        label.setFont(f)
-        label.setToolTip("A field of this entry only" if personal
-                         else "A field shared by every entry of this database")
+        self.marked = False
+        self.name = InlineText(name, placeholder="Field name", hint="Field name")
+        self.name.setFixedWidth(LABEL_WIDTH)
+        self.value = InlineText(value, multiline=True, placeholder="—")
+        self.name.set_dim(True)                               # field names are grey, like Contacts
+        self.name.on_menu = self.value.on_menu = self.set_marked
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
-        lay.addWidget(label)
-        if editable:
-            self.editor = GrowingTextEdit(value)
-            lay.addWidget(self.editor, 1)
-            minus = icon_button("–", f"Remove “{name}”", 24)
-            minus.clicked.connect(self.remove_clicked.emit)
-            lay.addWidget(minus, 0, Qt.AlignmentFlag.AlignTop)
-        else:
-            self.editor = None
-            text = QLabel(value)
-            text.setWordWrap(True)
-            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            lay.addWidget(text, 1)
+        lay.addWidget(self.name, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(self.value, 1)
 
-    def value(self) -> str:
-        return self.editor.toPlainText() if self.editor is not None else ""
+    def set_value(self, value: str) -> None:
+        self.value.set_text(value)
+
+    def set_marked(self, on: bool) -> None:
+        self.marked = on
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if self.marked:
+            color = self.palette().color(QPalette.ColorRole.Highlight)
+            color.setAlpha(55)
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(-3, -1, 3, 1), 5, 5)
+            p.end()
+        super().paintEvent(event)
+
+
+def dropped_images(mime) -> list:
+    """Photo files (Path) or image data (bytes) carried by a drag from outside the app."""
+    files = [Path(u.toLocalFile()) for u in mime.urls() if u.isLocalFile() and is_supported(u.toLocalFile())]
+    if files:
+        return files
+    if mime.hasImage():
+        from PySide6.QtGui import QImage
+        from .common import qimage_to_png_bytes
+        image = QImage(mime.imageData())
+        if not image.isNull():
+            return [qimage_to_png_bytes(image)]
+    return []
 
 
 class PhotoGrid(QListWidget):
     """The album grid. Photos always snap to the grid and pack to the left; dragging one either
-    inserts it between two photos or swaps it with the photo it is dropped on."""
+    inserts it between two photos or swaps it with the photo it is dropped on. The first photo, the
+    cover, has a frame. Photos dragged in from outside are added."""
 
     reordered = Signal(list)                       # photo ids in the new order
+    dropped = Signal(list)                         # photos dragged in from outside: Path or bytes
     DROP_COLOR = QColor(59, 130, 246)
 
     def __init__(self, parent=None):
@@ -108,15 +365,12 @@ class PhotoGrid(QListWidget):
         self.setResizeMode(QListView.ResizeMode.Adjust)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setDropIndicatorShown(False)                    # we draw our own
-        self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self._drag_row = -1
         self._drop: tuple[str, int] | None = None
-
-    def set_reorderable(self, on: bool) -> None:
-        self.setDragEnabled(on)
-        self.viewport().setAcceptDrops(on)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove if on
-                             else QAbstractItemView.DragDropMode.NoDragDrop)
+        self._outside = False                      # the drag comes from outside the app
+        self.setDragEnabled(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
 
     def ids(self) -> list[str]:
         return [self.item(i).data(ROLE_ID) for i in range(self.count())]
@@ -165,12 +419,19 @@ class PhotoGrid(QListWidget):
             self.viewport().update()
 
     def dragEnterEvent(self, event):
+        self._outside = self._drag_row < 0 and bool(dropped_images(event.mimeData()))
         if self._drag_row >= 0:
             event.acceptProposedAction()
+        elif self._outside:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
+        if self._outside:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            return event.accept()
         if self._drag_row < 0:
             return event.ignore()
         self._drop = self.target_at(event.position().toPoint())
@@ -184,6 +445,14 @@ class PhotoGrid(QListWidget):
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
+        if self._outside:
+            self._outside = False
+            items = dropped_images(event.mimeData())
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            if items:
+                QTimer.singleShot(0, lambda: self.dropped.emit(items))
+            return
         drop, source = self._drop, self._drag_row
         self._drop = None
         self.viewport().update()
@@ -201,9 +470,9 @@ class PhotoGrid(QListWidget):
         super().paintEvent(event)
         if self._drop is None or not self.count():
             return
-        kind, target = self._drop
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        kind, target = self._drop
         color = self.DROP_COLOR
         if kind == "swap":
             rect = self._rect(target).adjusted(2, 2, -2, -2)
@@ -223,45 +492,18 @@ class PhotoGrid(QListWidget):
         painter.end()
 
 
-class AddFieldDialog(QDialog):
-    """Ask for a new field: shared by the whole database, or only on this entry."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Add a field")
-        self.name = QLineEdit()
-        self.name.setPlaceholderText("Field name, e.g. “Met at” or “Phone”")
-        self.shared = QRadioButton("Shared field – every entry of this database gets it")
-        self.personal = QRadioButton("Only this entry")
-        self.shared.setChecked(True)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Name of the new field:"))
-        lay.addWidget(self.name)
-        lay.addWidget(self.shared)
-        lay.addWidget(self.personal)
-        lay.addWidget(buttons)
-        self.setMinimumWidth(420)
-
-    def values(self) -> tuple[str, bool]:
-        return self.name.text().strip(), self.shared.isChecked()
-
-
 class PhotoDialog(QDialog):
-    """A photo of an album, with its faces. Clicking a face makes it the one used for matching."""
+    """A photo of an album, with its faces, and a note of the user's own under it. Double-clicking a
+    face makes it the one used for matching; a single click changes nothing, so a stray click cannot."""
 
-    changed = Signal()
+    face_changed = Signal(str, object, object)            # photo id, the face used before, the one used now
 
-    def __init__(self, service, runner, entry_id: str, photo_ref, image, faces: list[Face],
-                 editable: bool = False, parent=None):
+    def __init__(self, service, runner, entry_id: str, photo_ref, image, faces: list[Face], parent=None):
         super().__init__(parent)
         self.service = service
         self.runner = runner
         self.entry_id = entry_id
         self.ref = photo_ref
-        self.editable = editable
         self.faces = [faces[i] for i in reading_order(faces)]
         self.setWindowTitle("Photo")
         self.resize(820, 700)
@@ -270,47 +512,47 @@ class PhotoDialog(QDialog):
         if photo_ref.face is not None and self.faces:
             overlaps = [iou(photo_ref.face, f) for f in self.faces]
             current = max(range(len(self.faces)), key=overlaps.__getitem__) if max(overlaps) > 0.5 else -1
-        interactive = editable and len(self.faces) > 1
-        self.view = QueryView(interactive=interactive, hint="Click a face to use that one for matching.")
-        self.view.image.hover_text = "Face {n} – click to use it for matching"
+        interactive = bool(self.faces) and (len(self.faces) > 1 or current < 0)
+        self.view = QueryView(interactive=interactive, double_click=True)
+        self.view.info.hide()
         self.view.show_query(render_photo(image, self.faces), self.faces, current)
         if interactive:
             self.view.face_selected.connect(self._apply)
 
-        self.status = muted(self._status_text(current))
+        self.save_note = None             # save_note(photo id, old, new) -> bool; set by the page (undo)
+        self.note = InlineText(photo_ref.note, multiline=True, placeholder="Note")
+        self.note.committed.connect(self._note_committed)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
         lay = QVBoxLayout(self)
         lay.addWidget(self.view, 1)
-        lay.addWidget(self.status)
+        lay.addWidget(self.note)
         lay.addWidget(buttons)
-        make_labels_selectable(self)
 
-    def _status_text(self, selected: int) -> str:
-        where = "added from a search" if self.ref.from_query else "imported"
-        base = f"Added {fmt_time(self.ref.added_at)}, {where}."
-        if not self.faces:
-            return base + " No face was found in this photo, so it is not used for matching."
-        if selected < 0:
-            return base + " This photo is not used for matching – click a face to use it."
-        if len(self.faces) == 1:
-            return base + " The face in the green box is used for matching."
-        if self.editable:
-            return base + f" Face {selected + 1} (green) is used for matching."
-        return base + (f" Face {selected + 1} (green) is used for matching – edit the entry (✏️) to "
-                       "pick another one.")
+    def _note_committed(self, text: str) -> None:
+        old = self.ref.note
+        if self.save_note is not None:
+            ok = self.save_note(self.ref.photo_id, old, text)
+        else:
+            self.service.set_photo_note(self.entry_id, self.ref.photo_id, text)
+            ok = True
+        if ok:
+            self.ref.note = text
+            self.note.set_text(text)
+
+    def done(self, result: int) -> None:
+        self.note.finish(True)                # closing (or locking) keeps what was typed
+        super().done(result)
 
     def _apply(self, index: int) -> None:
-        self.status.setText("Saving…")
-        photo_id = self.ref.photo_id
+        photo_id, before = self.ref.photo_id, self.ref.face
 
         def done(ref):
             self.ref = ref
-            self.status.setText(self._status_text(index))
-            self.changed.emit()
+            self.face_changed.emit(photo_id, before, ref.face)
 
         def failed(exc):
-            self.status.setText(str(exc))
+            QMessageBox.warning(self, "Photo", str(exc))
 
         self.runner.submit(lambda: self.service.choose_face(self.entry_id, photo_id, self.faces[index]),
                            on_done=done, on_error=failed)
@@ -320,19 +562,29 @@ class PhotoDialog(QDialog):
 
 class LibraryPage(QWidget):
     changed = Signal()
+    reveal = Signal()                      # an undo or redo step: bring the Library page to the front
 
     def __init__(self, service, runner, parent=None):
         super().__init__(parent)
         self.service = service
         self.runner = runner
         self.entry: Entry | None = None
-        self.editing = False
-        self._dirty = False
-        self._loading = False
-        self._pending_order: list[str] | None = None          # photo order waiting to be saved
-        self._rows: list[tuple[str, str, FieldRow]] = []      # (kind, id-or-name, row) while editing
+        self.undo_stack = QUndoStack(self)
+        self.undo_stack.setUndoLimit(UNDO_LIMIT)
+        self._active: InlineText | None = None                 # the text box open right now
+        self._rows: dict[tuple, FieldRow] = {}                  # ("field", id) / ("own", name) -> row
+        self._divider: QWidget | None = None                    # between shared and own fields
+        self.add_actions = {                                     # in the order of the page
+            "shared": self._action("Add Field to All Entries", "Ctrl+Shift+;",
+                                   lambda: self._add_field_action("shared")),
+            "own": self._action("Add Field to This Entry", "Ctrl+;", lambda: self._add_field_action("own")),
+        }
+        self._body_key = None                                    # what the field rows were built from
+        self._light = False
+        self._push_failed = False
 
         split = QSplitter()
+        split.setHandleWidth(GUTTER)
         split.addWidget(self._build_list())
         split.addWidget(self._build_entry())
         split.setStretchFactor(0, 2)
@@ -340,9 +592,31 @@ class LibraryPage(QWidget):
         split.setChildrenCollapsible(False)
         split.setSizes([300, 950])
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
         lay.addWidget(split)
         self._show_entry(False)
+
+    def _action(self, text: str, shortcut: str, slot) -> QAction:
+        action = QAction(text, self)
+        action.setShortcut(QKeySequence(shortcut))
+        action.triggered.connect(slot)
+        return action
+
+    def delete_target(self, focus):
+        """What ⌫ deletes: the selected photo in the album, or the selected entry in the list.
+        Fields have no selection, so they are not deleted by key (clear the name instead)."""
+        if has_focus_in(self.photos, focus) and self._current_photo() is not None:
+            return self.remove_photo
+        if has_focus_in(self.list, focus) and self.entry is not None:
+            return self.delete_entry
+        return None
+
+    def _add_field_action(self, kind: str) -> None:
+        if not self.service.unlocked or self.entry is None:
+            QApplication.beep()
+            return
+        self.reveal.emit()
+        self.new_field(kind)
 
     # --- left: the list of entries ------------------------------------------------------------
 
@@ -366,16 +640,15 @@ class LibraryPage(QWidget):
         self.list.currentItemChanged.connect(self._entry_selected)
         add_copy_action(self.list)
         self.count = muted()
-        new_btn = icon_button("+", "New entry (⌘N)")
+        new_btn = icon_button("plus", "New entry (⌘N)")
         new_btn.clicked.connect(self.new_entry)
-        import_btn = QPushButton("Import…")
-        import_btn.setToolTip("Import a folder that holds one sub-folder per person")
+        import_btn = icon_button("import", "Import a folder…")
         import_btn.clicked.connect(self.import_folder)
 
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
-        ll.setSpacing(6)
+        ll.setSpacing(GAP)
         ll.addWidget(header_row("Library", new_btn, import_btn))
         ll.addLayout(search_row)
         ll.addWidget(self.list, 1)
@@ -385,82 +658,76 @@ class LibraryPage(QWidget):
     # --- right: one entry --------------------------------------------------------------------------
 
     def _build_entry(self) -> QWidget:
-        self.title = heading("", 17)
-        self.title.setWordWrap(False)
-        self.aliases_label = ElidedLabel()
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("Name")
-        self.name_edit.textEdited.connect(self._mark_dirty)
-        self.edit_btn = icon_button("✏️", "Edit this entry")
-        self.edit_btn.clicked.connect(lambda: self.set_editing(True))
-        self.save_btn = icon_button("✓", "Save the changes")
-        self.save_btn.clicked.connect(self.save)
-        self.cancel_btn = icon_button("↩", "Discard the changes")
-        self.cancel_btn.clicked.connect(lambda: self.set_editing(False, discard=True))
-        self.export_btn = QPushButton("Export…")
-        self.export_btn.setToolTip("Write an unencrypted copy of this entry into a folder")
+        title_font = semibold(self.font(), 22)
+        self.title = self._track(InlineText(font=title_font, wrap=False))
+        self.title.validate = lambda text: None if text.strip() else "The entry needs a name."
+        self.title.committed.connect(self._name_committed)
+        self.aliases_text = self._track(InlineText(placeholder="Aliases", label=ElidedLabel(),
+                                                   display=lambda t: "·  " + dotted(t)))
+        self.aliases_text.committed.connect(lambda text: self._list_committed("aliases", "Aliases", text))
+        self.tags_text = self._track(InlineText(placeholder="Tags", label=muted(), display=dotted))
+        self.tags_text.committed.connect(lambda text: self._list_committed("tags", "Tags", text))
+
+        self.export_btn = icon_button("export", "Export an unencrypted copy…")
         self.export_btn.clicked.connect(self.export_entry)
-        self.delete_btn = icon_button("🗑", "Move this entry and its photos to the Trash")
+        self.delete_btn = icon_button("trash", "Move this entry and its photos to the Trash")
         self.delete_btn.clicked.connect(self.delete_entry)
-        header = header_row("", self.edit_btn, self.save_btn, self.cancel_btn, self.export_btn, self.delete_btn)
+        header = header_row("", self.export_btn, self.delete_btn)
         header.layout().insertWidget(0, self.title)
-        header.layout().insertWidget(1, self.aliases_label, 1)
-        header.layout().insertWidget(2, self.name_edit, 1)
+        header.layout().insertWidget(1, self.aliases_text, 1)
 
-        self.tags_label = muted()
-        self.view_body = QVBoxLayout()
-        self.view_body.setSpacing(6)
-        self.edit_body = QVBoxLayout()
-        self.edit_body.setSpacing(6)
-        self.pages = QStackedWidget()
-        for body in (self.view_body, self.edit_body):
-            holder = QWidget()
-            holder.setLayout(body)
-            body.addStretch(1)
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            scroll.setWidget(holder)
-            self.pages.addWidget(scroll)
+        self.body = QVBoxLayout()
+        self.body.setContentsMargins(0, 0, 0, 0)                # fields line up with the name above
+        self.body.setSpacing(GAP)
+        self.body.addStretch(1)
+        self.body_holder = QWidget()
+        self.body_holder.setLayout(self.body)
+        self.body_holder.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.body_holder.customContextMenuRequested.connect(self._body_menu)
+        self.body_scroll = QScrollArea()
+        self.body_scroll.setWidgetResizable(True)
+        self.body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body_scroll.setWidget(self.body_holder)
 
-        self.photos_title = heading("Photos", 13)
-        self.add_photo_btn = icon_button("+", "Add photos to this entry")
+        self.photos_title = QLabel("Photos")
+        self.photos_title.setFont(semibold(self.photos_title.font(), 15))
+        make_selectable(self.photos_title)
+        self.add_photo_btn = icon_button("plus", "Add photos to this entry (⌘O)")
         self.add_photo_btn.clicked.connect(self.add_photos)
-        self.remove_photo_btn = icon_button("–", "Move the selected photo to the Trash")
+        self.remove_photo_btn = icon_button("minus", "Move the selected photo to the Trash")
         self.remove_photo_btn.clicked.connect(self.remove_photo)
-        self.exclude_btn = icon_button("🚫", "Do not use the selected photo for matching", checkable=True)
+        self.exclude_btn = icon_button("ban", "Do not use the selected photo for matching", checkable=True)
         self.exclude_btn.clicked.connect(self.toggle_excluded)
-        self.photo_hint = muted()
         photos_header = QHBoxLayout()
         photos_header.addWidget(self.photos_title)
-        photos_header.addSpacing(8)
-        photos_header.addWidget(self.photo_hint, 1)
+        photos_header.addStretch(1)
         for b in (self.add_photo_btn, self.remove_photo_btn, self.exclude_btn):
             photos_header.addWidget(b)
 
         self.photos = PhotoGrid()
         self.photos.setIconSize(QSize(PHOTO_ICON, PHOTO_ICON))
-        self.photos.setGridSize(QSize(PHOTO_ICON + 16, PHOTO_ICON + 34))
+        self.photos.setGridSize(QSize(PHOTO_ICON + 16, PHOTO_ICON + 16))
         self.photos.setMinimumHeight(PHOTO_ICON + 50)
         self.photos.itemDoubleClicked.connect(lambda _i: self.open_photo())
         self.photos.currentItemChanged.connect(lambda *_: self._update_photo_buttons())
         self.photos.reordered.connect(self._photos_reordered)
+        self.photos.dropped.connect(lambda items: self.add_photo_files(self.entry.id, items) if self.entry else None)
 
         self.stamps = muted()
 
         self.entry_widget = QWidget()
         el = self.entry_layout = QVBoxLayout(self.entry_widget)
         el.setContentsMargins(0, 0, 0, 0)
-        el.setSpacing(6)
+        el.setSpacing(GAP)
         el.addWidget(header)
-        el.addWidget(self.tags_label)
-        el.addWidget(self.pages, 3)
+        el.addWidget(self.tags_text)
+        el.addWidget(self.body_scroll, 4)
         el.addLayout(photos_header)
         el.addWidget(self.photos, 4)
         el.addWidget(self.stamps)
 
-        self.placeholder = muted("Select an entry, create a new one, or import a folder.")
+        self.placeholder = muted()
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right = QWidget()
         rl = QVBoxLayout(right)
@@ -468,6 +735,29 @@ class LibraryPage(QWidget):
         rl.addWidget(self.placeholder)
         rl.addWidget(self.entry_widget, 1)
         return right
+
+    # --- the text box that is open ----------------------------------------------------------------
+
+    def _track(self, inline: InlineText) -> InlineText:
+        inline.started.connect(lambda: setattr(self, "_active", inline))
+        inline.finished.connect(lambda: setattr(self, "_active", None) if self._active is inline else None)
+        return inline
+
+    def _editing(self) -> bool:
+        try:
+            return self._active is not None and self._active.editing
+        except RuntimeError:                       # its widget is gone
+            self._active = None
+            return False
+
+    def commit_edits(self) -> None:
+        """Save the text box that is open (before locking, switching entries, undoing …)."""
+        if self._editing():
+            self._active.finish(True)
+
+    @property
+    def has_unsaved_changes(self) -> bool:
+        return self._editing()
 
     # --- list handling -------------------------------------------------------------------------------
 
@@ -481,7 +771,7 @@ class LibraryPage(QWidget):
         self.list.blockSignals(True)
         self.list.clear()
         for e in entries:
-            item = QListWidgetItem(f"{e.name}\n{len(e.photos)} photo(s)")
+            item = QListWidgetItem(self._list_text(e))
             pm = placeholder_pixmap(40, e.name[:1].upper() or "?")
             if e.cover is not None:
                 try:
@@ -497,16 +787,25 @@ class LibraryPage(QWidget):
         self.list.blockSignals(False)
         self.count.setText(f"{len(entries)} entries · {sum(len(e.photos) for e in entries)} photos")
         self._apply_filter()
-        if current and any(e.id == current for e in entries):
-            if not self._dirty and not self.editing:          # never interrupt an edit in progress
-                self._load_entry(current)
-        else:
-            self._load_entry(None)
+        self._load_entry(current if current and any(e.id == current for e in entries) else None)
+
+    @staticmethod
+    def _list_text(e: Entry) -> str:
+        return f"{e.name}\n{len(e.photos)} photo(s)"
+
+    def _update_list_item(self, e: Entry) -> None:
+        field_ids = [f.id for f in self.service.global_fields()]
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            if item.data(ROLE_ID) == e.id:
+                item.setText(self._list_text(e))
+                item.setData(ROLE_SEARCH, haystacks(e, field_ids))
+        self._apply_filter()
 
     def _fill_scopes(self) -> None:
         wanted = [("All fields", SCOPE_ALL), ("Name", SCOPE_NAME), ("Tags", SCOPE_TAGS)]
         wanted += [(f.name, f.id) for f in self.service.global_fields()]
-        if [self.scope.itemData(i) for i in range(self.scope.count())] == [w[1] for w in wanted]:
+        if [(self.scope.itemText(i), self.scope.itemData(i)) for i in range(self.scope.count())] == wanted:
             return
         keep = self.scope.currentData()
         self.scope.blockSignals(True)
@@ -532,24 +831,8 @@ class LibraryPage(QWidget):
                 self.list.setCurrentRow(i)
                 return
 
-    def _entry_selected(self, item: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
-        if self._dirty and self.entry is not None and not self._resolve_unsaved():
-            self.list.blockSignals(True)
-            self.list.setCurrentItem(previous)
-            self.list.blockSignals(False)
-            return
+    def _entry_selected(self, item: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         self._load_entry(item.data(ROLE_ID) if item else None)
-
-    def _resolve_unsaved(self) -> bool:
-        box = QMessageBox(self)
-        box.setWindowTitle("Unsaved changes")
-        box.setText(f"Save the changes to “{self.entry.name}”?")
-        box.setStandardButtons(QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
-                               | QMessageBox.StandardButton.Cancel)
-        choice = box.exec()
-        if choice == QMessageBox.StandardButton.Save:
-            return self.save()
-        return choice == QMessageBox.StandardButton.Discard
 
     # --- showing one entry ------------------------------------------------------------------------------
 
@@ -558,226 +841,268 @@ class LibraryPage(QWidget):
         self.placeholder.setVisible(not on)
 
     def _load_entry(self, entry_id: str | None) -> None:
-        self._loading = True
-        try:
-            self.entry = self.service.get_entry(entry_id) if entry_id and self.service.unlocked else None
-            self._show_entry(self.entry is not None)
-            if self.entry is None:
-                self.photos.clear()
-                return
-            self.set_editing(False, reload=True)
-            self._load_photos()
-        finally:
-            self._loading = False
-            self._set_dirty(False)
-
-    def set_editing(self, editing: bool, discard: bool = False, reload: bool = False) -> None:
-        """Switch between the read-only page and the edit form."""
+        if self._editing() and (self.entry is None or entry_id != self.entry.id):
+            self.commit_edits()                                  # never lose what is being typed
+        ok = entry_id and self.service.unlocked and self.service.has_entry(entry_id)
+        self.entry = self.service.get_entry(entry_id) if ok else None
+        self._show_entry(self.entry is not None)
         if self.entry is None:
+            self.photos.clear()
+            self._body_key = None
             return
-        if not editing and self._dirty and not discard and not reload:
-            if not self._resolve_unsaved():
-                return
-        if discard or reload:
-            self._pending_order = None
-            self.entry = self.service.get_entry(self.entry.id)
-            self._set_dirty(False)
-            self._load_photos()
-        self.editing = editing
-        self.pages.setCurrentIndex(1 if editing else 0)
-        self.title.setVisible(not editing)
-        self.aliases_label.setVisible(not editing)
-        self.tags_label.setVisible(not editing)
-        self.name_edit.setVisible(editing)
-        self.edit_btn.setVisible(not editing)
-        self.save_btn.setVisible(editing)
-        self.cancel_btn.setVisible(editing)
-        for b in (self.add_photo_btn, self.remove_photo_btn, self.exclude_btn):
-            b.setVisible(editing)
-        self.export_btn.setVisible(not editing)
-        self.delete_btn.setVisible(not editing)
-        self.photos.set_reorderable(editing)
-        self.entry_layout.setStretch(2, 5 if editing else 3)          # the text part
-        self.entry_layout.setStretch(4, 3 if editing else 4)          # the album
-        self.photo_hint.setText("Drag a photo between two others to insert it, or onto one to swap them – "
-                                "the first photo is the cover." if editing else "")
-        self._build_body()
+        self._update_header()
+        if not self._editing() and self._fields_key() != self._body_key:
+            self._build_body()                    # rebuilt only when the fields changed (keeps the scroll)
+        self._load_photos()
+
+    def _update_header(self) -> None:
+        e = self.entry
+        self.title.set_text(e.name)
+        self.aliases_text.set_text(", ".join(e.aliases))
+        self.tags_text.set_text(", ".join(e.tags))
+        self.stamps.setText(f"Created {fmt_time(e.created_at)}  ·  updated {fmt_time(e.updated_at)}")
+
+    def _fields_key(self):
+        e = self.entry
+        return (e.id, tuple(sorted(e.fields.items())), tuple((f.name, f.value) for f in e.own),
+                tuple((f.id, f.name) for f in self.service.global_fields()))
 
     def _build_body(self) -> None:
-        loading, self._loading = self._loading, True
-        try:
-            body = self.edit_body if self.editing else self.view_body
-            while body.count() > 1:                                  # keep the trailing stretch
-                item = body.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            self._rows = []
-            e = self.entry
-            self.title.setText(e.name)
-            self.name_edit.setText(e.name)
-            self.aliases_label.setText(("  ·  " + "  ·  ".join(e.aliases)) if e.aliases else "")
-            self.tags_label.setText("  ·  ".join(e.tags))
-            self.tags_label.setVisible(bool(e.tags) and not self.editing)
-            self.stamps.setText(f"Created {fmt_time(e.created_at)}  ·  updated {fmt_time(e.updated_at)}")
-            if self.editing:
-                self._build_edit_body(body, e)
-            else:
-                self._build_view_body(body, e)
-            make_labels_selectable(self)
-        finally:
-            self._loading = loading
-
-    def _build_view_body(self, body: QVBoxLayout, e: Entry) -> None:
-        shown = 0
+        e = self.entry
+        same = self._body_key is not None and self._body_key[0] == e.id
+        scroll = self.body_scroll.verticalScrollBar().value() if same else 0
+        while self.body.count() > 1:                             # keep the trailing stretch
+            item = self.body.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._rows, self._divider = {}, None
         for spec in self.service.global_fields():
-            text = e.fields.get(spec.id, "").strip()
-            if text:
-                body.insertWidget(body.count() - 1, FieldRow(spec.name, text, False, False))
-                shown += 1
-        own = [f for f in e.own if f.value.strip()]
-        if own:
-            body.insertWidget(body.count() - 1, divider("only in this entry"))
-            for f in own:
-                body.insertWidget(body.count() - 1, FieldRow(f.name, f.value, True, False))
-                shown += 1
-        if not shown:
-            body.insertWidget(body.count() - 1, muted("No information yet – press the pencil to add some."))
-
-    def _build_edit_body(self, body: QVBoxLayout, e: Entry) -> None:
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self.aliases = QLineEdit(", ".join(e.aliases))
-        self.aliases.setPlaceholderText("Other names, separated by commas")
-        self.tags = QLineEdit(", ".join(e.tags))
-        self.tags.setPlaceholderText("Tags, separated by commas")
-        for w in (self.aliases, self.tags):
-            w.textEdited.connect(self._mark_dirty)
-        form.addRow("Aliases", self.aliases)
-        form.addRow("Tags", self.tags)
-        holder = QWidget()
-        holder.setLayout(form)
-        body.insertWidget(body.count() - 1, holder)
-
-        for spec in self.service.global_fields():
-            self._add_row(body, "global", spec.id, spec.name, e.fields.get(spec.id, ""))
+            self._add_row(("field", spec.id), spec.name, e.fields.get(spec.id, ""), personal=False)
         if e.own:
-            body.insertWidget(body.count() - 1, divider("only in this entry"))
+            self._add_divider()
         for own in e.own:
-            self._add_row(body, "own", own.name, own.name, own.value)
+            self._add_row(("own", own.name), own.name, own.value, personal=True)
+        self._body_key = self._fields_key()
+        if scroll:
+            QTimer.singleShot(0, lambda: self.body_scroll.verticalScrollBar().setValue(scroll))
 
-        add_btn = QPushButton("+ Add a field…")
-        add_btn.setToolTip("A field shared by every entry, or one just for this entry")
-        add_btn.clicked.connect(self.add_field)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        row.addWidget(add_btn)
-        wrap = QWidget()
-        wrap.setLayout(row)
-        body.insertWidget(body.count() - 1, wrap)
+    def _add_divider(self) -> None:
+        self._divider = divider()
+        self._insert(self._divider)
 
-    def _add_row(self, body: QVBoxLayout, kind: str, key: str, name: str, value: str) -> None:
-        row = FieldRow(name, value, kind == "own", True)
-        row.editor.textChanged.connect(self._mark_dirty)
-        row.remove_clicked.connect(lambda k=kind, key=key, name=name: self.remove_field(k, key, name))
-        body.insertWidget(body.count() - 1, row)
-        self._rows.append((kind, key, row))
+    def _add_menu(self) -> list:
+        return [(a.text(), a.trigger) for a in self.add_actions.values()]
 
-    # --- editing ------------------------------------------------------------------------------------------
+    def _body_menu(self, pos) -> None:
+        """Right-click beside the fields."""
+        if self.entry is not None:
+            run_menu(self._add_menu(), self.body_holder.mapToGlobal(pos), self)
 
-    def _mark_dirty(self, *_args) -> None:
-        if not self._loading:
-            self._set_dirty(True)
+    def _insert(self, widget: QWidget, before: QWidget | None = None) -> None:
+        index = self.body.indexOf(before) if before is not None else self.body.count() - 1
+        self.body.insertWidget(index, widget)
 
-    def _set_dirty(self, dirty: bool) -> None:
-        self._dirty = dirty
+    def _add_row(self, key: tuple, name: str, value: str, personal: bool) -> FieldRow:
+        row = FieldRow(name, value, personal)
+        self._track(row.name)
+        self._track(row.value)
+        row.value.committed.connect(lambda text, key=key, name=name: self._value_committed(key, name, text))
+        row.name.validate = lambda text, key=key: (self._field_name_problem(text, exclude=key) if text.strip()
+                                                   else None)      # no name: the field is removed
+        row.name.committed.connect(lambda text, key=key, name=name: self._name_committed_for(key, name, text))
+        menu = [(f"Remove “{name}”", lambda key=key, name=name: self.remove_field(key, name)), None]
+        row.name.menu_actions = row.value.menu_actions = menu + self._add_menu()
+        self._insert(row)
+        self._rows[key] = row
+        return row
 
-    def collect(self) -> Entry:
-        """The entry as the form currently shows it."""
-        e = self.service.get_entry(self.entry.id)
-        e.name = self.name_edit.text().strip()
-        e.aliases = split_list(self.aliases.text())
-        e.tags = split_list(self.tags.text())
-        e.fields = {key: row.value() for kind, key, row in self._rows if kind == "global"}
-        e.own = [OwnField(key, row.value()) for kind, key, row in self._rows if kind == "own"]
-        return e
+    # --- undo history --------------------------------------------------------------------------------
 
-    def save(self) -> bool:
-        if self.entry is None or not self.editing:
-            return True
-        edited = self.collect()
-        if not edited.name:
-            QMessageBox.warning(self, "Save", "The entry needs a name.")
-            return False
-        self._flush_photo_order()
-        self.service.update_entry(edited)
-        self._set_dirty(False)
-        self.entry = self.service.get_entry(edited.id)
-        self.set_editing(False)
-        self.refresh(edited.id)
-        self.changed.emit()
-        return True
+    def _callbacks(self) -> dict:
+        return {"done": self._step_done, "failed": self._step_failed}
 
-    def add_field(self) -> None:
-        dlg = AddFieldDialog(self)
-        if not dlg.exec():
-            return
-        name, shared = dlg.values()
-        if not name:
-            return
-        if shared:
-            try:
-                spec = self.service.add_global_field(name)
-            except Exception as exc:
-                QMessageBox.warning(self, "Add a field", str(exc))
-                return
-            pending = self.collect()
-            self.service.update_entry(pending)
-            self.entry = self.service.get_entry(pending.id)
-            self._build_body()
-            self._fill_scopes()
-            self.changed.emit()
-            self._focus_row("global", spec.id)
+    def _push(self, command, light: bool = False) -> bool:
+        """Make a change through the undo history. `light`: the page already shows it (it was typed),
+        so only the header and the list are brought up to date."""
+        self._light, self._push_failed = light, False
+        try:
+            self.undo_stack.push(command)
+        finally:
+            self._light = False
+        return not self._push_failed
+
+    def _step_done(self, entry_id: str | None) -> None:
+        if self._light and entry_id and self.entry is not None and entry_id == self.entry.id:
+            self.entry = self.service.get_entry(entry_id)
+            self._update_header()
+            self._update_list_item(self.entry)
+            self._body_key = self._fields_key()
         else:
-            if self.entry.own_field(name) or any(fold(f.name) == fold(name)
-                                                 for f in self.service.global_fields()):
-                QMessageBox.warning(self, "Add a field", f"There is already a field called “{name}”.")
-                return
-            pending = self.collect()
-            pending.own.append(OwnField(name, ""))
-            self.entry = pending
-            self._build_body()
-            self._set_dirty(True)
-            self._focus_row("own", name)
+            self.refresh(entry_id)
+        self.changed.emit()
 
-    def _focus_row(self, kind: str, key: str) -> None:
-        for row_kind, row_key, row in self._rows:
-            if row_kind == kind and row_key == key and row.editor is not None:
-                row.editor.setFocus()
-                return
+    def _step_failed(self, command, exc: Exception) -> None:
+        self._push_failed = True
+        what = {"do": "save the change", "undo": f"undo “{command.text()}”",
+                "redo": f"redo “{command.text()}”"}[command.phase]
+        QMessageBox.warning(self, "FaceDictionary", f"Could not {what}: {exc}")
+        if command.phase != "do":
+            self.refresh()
+            self.changed.emit()
 
-    def remove_field(self, kind: str, key: str, name: str) -> None:
-        if kind == "own":
-            pending = self.collect()
-            pending.own = [f for f in pending.own if f.name != key]
-            self.entry = pending
-            self._build_body()
-            self._set_dirty(True)
+    def undo(self) -> None:
+        if self._editing():                       # Edit › Undo while typing: the text box's own undo
+            self._active.editor.undo()
+            return
+        self._step(self.undo_stack.undo, self.undo_stack.canUndo())
+
+    def redo(self) -> None:
+        if self._editing():
+            self._active.editor.redo()
+            return
+        self._step(self.undo_stack.redo, self.undo_stack.canRedo())
+
+    def _step(self, step, possible: bool) -> None:
+        if not possible or not self.service.unlocked:
+            return
+        if self.runner.busy or QApplication.activeModalWidget() is not None:
+            QApplication.beep()                   # wait until photos are added, a dialog is closed …
+            return
+        self.reveal.emit()
+        step()
+
+    # --- text -------------------------------------------------------------------------------------------
+
+    def _name_committed(self, text: str) -> None:
+        if self.entry is None:
+            return
+        self._push(undo.SetText(self.service, self.entry.id, "name", self.entry.name, text.strip(), "Name",
+                                **self._callbacks()), light=True)
+
+    def _list_committed(self, key: str, label: str, text: str) -> None:
+        if self.entry is None:
+            return
+        old, new = list(getattr(self.entry, key)), split_values(text)
+        if new == old:
+            self._update_header()                 # only the commas changed: show it tidied up
+            return
+        self._push(undo.SetText(self.service, self.entry.id, key, old, new, label, **self._callbacks()),
+                   light=True)
+
+    def _value_committed(self, key: tuple, name: str, text: str) -> None:
+        e = self.entry
+        if e is None:
+            return
+        if key[0] == "field":
+            old = e.fields.get(key[1], "")
+        else:
+            own = e.own_field(key[1])
+            old = own.value if own else ""
+        if self._push(undo.SetText(self.service, e.id, key, old, text, f"“{name}”", **self._callbacks()),
+                      light=True):
+            row = self._rows.get(key)
+            if row is not None:
+                row.set_value(text)
+
+    # --- fields ----------------------------------------------------------------------------------------
+
+    def _field_name_problem(self, name: str, exclude: tuple | None = None) -> str | None:
+        name = name.strip()
+        if not name:
+            return "A field needs a name."
+        taken = [(("field", f.id), f.name) for f in self.service.global_fields()]
+        taken += [(("own", f.name), f.name) for f in self.entry.own]
+        if any(fold(n) == fold(name) and key != exclude for key, n in taken):
+            return f"There is already a field called “{name}”."
+        return None
+
+    def new_field(self, kind: str) -> None:
+        """Add Field to All Entries / to This Entry: a new row at the end of that part, whose name is
+        typed in place. Enter goes on to its text; Esc, or leaving the name empty, adds nothing."""
+        if self.entry is None:
+            return
+        self.commit_edits()
+        row = FieldRow("", "", kind == "own")
+        if kind == "shared":
+            self._insert(row, before=self._divider)
+        else:
+            if self._divider is None:
+                self._add_divider()
+            self._insert(row)
+        self._track(row.name)
+        row.name.validate = self._field_name_problem
+        row.name.committed.connect(lambda name: self._create_field(kind, name.strip(), row))
+        row.name.finished.connect(lambda: self._new_field_closed(row))
+        row.name.start_edit()
+
+    def _create_field(self, kind: str, name: str, row: FieldRow) -> None:
+        e = self.entry
+        row.created = True
+        if kind == "shared":
+            command = undo.SharedFieldChange.new(self.service, e.id, name, **self._callbacks())
+            key = ("field", command.field_id)
+        else:
+            command = undo.OwnFieldChange(self.service, e.id, OwnField(name, ""), len(e.own), True,
+                                          **self._callbacks())
+            key = ("own", name)
+        if self._push(command) and row.name.by_key:
+            QTimer.singleShot(0, lambda: self.edit_field(key))     # Enter: go on to the field's text
+
+    def _new_field_closed(self, row: FieldRow) -> None:
+        if row.created:
+            return
+        self.body.removeWidget(row)
+        row.deleteLater()
+        if self._divider is not None and self.entry is not None and not self.entry.own:
+            self.body.removeWidget(self._divider)              # it only separates own fields
+            self._divider.deleteLater()
+            self._divider = None
+
+    def edit_field(self, key: tuple) -> None:
+        row = self._rows.get(key)
+        if row is not None:
+            row.value.start_edit()
+
+    def _name_committed_for(self, key: tuple, name: str, text: str) -> None:
+        if text.strip():
+            self._rename_field(key, text)
+        else:
+            self.remove_field(key, name)
+
+    def _rename_field(self, key: tuple, new: str) -> None:
+        e = self.entry
+        if key[0] == "field":
+            spec = next((f for f in self.service.global_fields() if f.id == key[1]), None)
+            if spec is None:
+                return
+            command = undo.RenameField(self.service, e.id, spec.id, spec.name, new.strip(), **self._callbacks())
+        else:
+            command = undo.RenameField(self.service, e.id, None, key[1], new.strip(), **self._callbacks())
+        self._push(command)
+
+    def remove_field(self, key: tuple, name: str) -> None:
+        e = self.entry
+        if e is None:
+            return
+        self.commit_edits()
+        if key[0] == "own":
+            index = next((i for i, f in enumerate(e.own) if f.name == key[1]), None)
+            if index is not None:
+                self._push(undo.OwnFieldChange(self.service, e.id, e.own[index], index, False,
+                                               **self._callbacks()))
+            return
+        spec = next((f for f in self.service.global_fields() if f.id == key[1]), None)
+        if spec is None:
             return
         n_entries = len(self.service.list_entries())
         if not confirm(self, "Remove a shared field",
                        f"“{name}” is shared by all {n_entries} entries of this database.\n\n"
                        "Removing it takes the field off every entry. Entries that have text in it keep "
-                       "that text as a field of their own.", "Remove from all entries", destructive=True):
+                       "that text as a field of their own.", "Remove from all entries",
+                       destructive=True):
             return
-        pending = self.collect()
-        self.service.update_entry(pending)
-        self.service.remove_global_field(key, keep_content=True)
-        self.entry = self.service.get_entry(pending.id)
-        self._set_dirty(False)
-        self._build_body()
-        self._fill_scopes()
-        self.refresh(self.entry.id)
-        self.changed.emit()
+        removed = undo.RemovedField(spec, 0)
+        self._push(undo.SharedFieldChange(self.service, e.id, removed, False, **self._callbacks()))
 
     # --- photos ---------------------------------------------------------------------------------------------
 
@@ -789,27 +1114,27 @@ class LibraryPage(QWidget):
         e = self.entry
         for i, ref in enumerate(e.photos):
             excluded = ref.face is None
-            label = "cover" if i == 0 else ("from a search" if ref.from_query else "")
-            if i > 0 and not excluded and ref.face_count > 1:
-                label = f"{ref.face_count} faces"
-            item = QListWidgetItem(label)
+            item = QListWidgetItem()
             try:
                 pm = bytes_to_pixmap(self.service.thumb_bytes(ref.photo_id, ref.face))
             except Exception:
                 pm = placeholder_pixmap(PHOTO_ICON)
             if excluded:
                 pm = mark_excluded(pm, PHOTO_ICON)
+            if i == 0:
+                pm = mark_cover(pm, PHOTO_ICON)
             item.setIcon(QIcon(pm))
             item.setData(ROLE_ID, ref.photo_id)
+            item.setData(ROLE_COVER, i == 0)
             origin = "added from a search" if ref.from_query else "imported"
-            tip = f"Added {fmt_time(ref.added_at)}, {origin}.\nDouble-click to see it big."
+            tip = f"Added {fmt_time(ref.added_at)}, {origin}."
             if i == 0:
                 tip += "\nThe first photo is the entry's cover."
             if excluded:
                 tip += ("\nNot used for matching" + (" – no face was found." if ref.face_count == 0 else
                                                      " (you switched it off)."))
             elif ref.face_count > 1:
-                tip += f"\n{ref.face_count} faces found; double-click to check which one is used."
+                tip += f"\n{ref.face_count} faces found."
             item.setToolTip(tip)
             self.photos.addItem(item)
             if ref.photo_id == keep:
@@ -819,21 +1144,14 @@ class LibraryPage(QWidget):
         self._update_photo_buttons()
 
     def _photos_reordered(self, order: list) -> None:
-        """A drag in the album: remember the new order and stay in edit mode until Save or Discard."""
-        if self.entry is None or not self.editing:
+        """A drag in the album: saved at once (⌘Z puts the old order back)."""
+        if self.entry is None:
             return
-        by_id = {p.photo_id: p for p in self.entry.photos}
-        if set(order) != set(by_id):
+        old = [p.photo_id for p in self.entry.photos]
+        if set(order) != set(old) or list(order) == old:
             return
-        self.entry.photos = [by_id[pid] for pid in order]
-        self._pending_order = list(order)
-        self._set_dirty(True)
-        self._load_photos()
-
-    def _flush_photo_order(self) -> None:
-        if self._pending_order and self.entry is not None:
-            self.service.set_photo_order(self.entry.id, self._pending_order)
-            self._pending_order = None
+        self.commit_edits()
+        self._push(undo.ReorderPhotos(self.service, self.entry.id, old, list(order), **self._callbacks()))
 
     def _update_photo_buttons(self) -> None:
         ref = self._current_photo()
@@ -854,23 +1172,25 @@ class LibraryPage(QWidget):
     def add_photos(self) -> None:
         if self.entry is None:
             return
-        self._flush_photo_order()
-        paths = open_images(self, "Add photos to this entry")
+        self.commit_edits()
+        paths = open_images(self, "Add photos to this entry", kind="album")
         if paths:
             self.add_photo_files(self.entry.id, [Path(p) for p in paths])
 
-    def add_photo_files(self, entry_id: str, paths: list[Path]) -> None:
+    def add_photo_files(self, entry_id: str, paths: list) -> None:
+        """Add photos to an album: files (Path) or image data (bytes), dropped in or chosen."""
+        self.commit_edits()
         dlg = QProgressDialog("Adding photos…", "Cancel", 0, len(paths), self)
         dlg.setWindowModality(Qt.WindowModality.WindowModal)
         dlg.setMinimumDuration(400)
 
         def work(progress, cancel):
-            added = dup = noface = errors = 0
+            added, dup, noface, errors = [], 0, 0, 0
             for i, p in enumerate(paths):
                 if cancel():
                     break
                 try:
-                    res = self.service.add_photo(entry_id, p.read_bytes())
+                    res = self.service.add_photo(entry_id, p if isinstance(p, bytes) else p.read_bytes())
                 except OSError:
                     errors += 1
                     continue
@@ -879,7 +1199,7 @@ class LibraryPage(QWidget):
                 elif res.duplicate:
                     dup += 1
                 else:
-                    added += 1
+                    added.append(res.photo.photo_id)
                     noface += res.face_count == 0
                 progress(i + 1, len(paths))
             return added, dup, noface, errors
@@ -887,38 +1207,47 @@ class LibraryPage(QWidget):
         def done(out):
             dlg.close()
             added, dup, noface, errors = out
-            parts = [f"Added {added} photo(s)."]
-            if noface:
-                parts.append(f"{noface} without a detectable face (kept, but not used for matching).")
-            if dup:
-                parts.append(f"{dup} already in the album (skipped).")
-            if errors:
-                parts.append(f"{errors} could not be read.")
+            if added:
+                self._push(undo.AddPhotos(self.service, entry_id, added, **self._callbacks()))
             self.refresh(entry_id)
             self.changed.emit()
-            QMessageBox.information(self, "Add photos", " ".join(parts))
+            notes = []
+            if noface:
+                notes.append(f"{noface} without a detectable face (kept, but not used for matching).")
+            if dup:
+                notes.append(f"{dup} already in the album (skipped).")
+            if errors:
+                notes.append(f"{errors} could not be read.")
+            if notes:                              # the new photos show up in the album by themselves
+                QMessageBox.information(self, "Add photos", " ".join([f"Added {len(added)} photo(s)."] + notes))
 
         task = self.runner.submit(work, on_done=done, on_progress=lambda d, t: dlg.setValue(d), with_progress=True,
                                   on_error=lambda exc: (dlg.close(), default_error_handler(exc)))
         dlg.canceled.connect(task.cancel)
 
     def open_photo(self) -> None:
-        """Double-click on a photo: show it big, with its faces; clicking a face picks the one to match on."""
+        """Double-click on a photo: show it big, with its faces; double-clicking a face picks the one to
+        match on."""
         ref = self._current_photo()
         if ref is None or self.entry is None:
             return
-        self._flush_photo_order()
+        self.commit_edits()
         entry_id = self.entry.id
-
-        editable = self.editing
 
         def done(out):
             img, faces = out
-            dlg = PhotoDialog(self.service, self.runner, entry_id, ref, img, faces, editable, self)
-            dlg.changed.connect(lambda: (self.refresh(entry_id), self.changed.emit()))
+            dlg = PhotoDialog(self.service, self.runner, entry_id, ref, img, faces, self)
+            dlg.face_changed.connect(lambda pid, old, new: self._face_changed(entry_id, pid, old, new))
+            dlg.save_note = lambda pid, old, new: self._push(
+                undo.SetPhotoNote(self.service, entry_id, pid, old, new, **self._callbacks()), light=True)
             dlg.exec()
 
         self.runner.submit(lambda: self.service.detect_faces(ref.photo_id), on_done=done)
+
+    def _face_changed(self, entry_id: str, photo_id: str, old: Face | None, new: Face | None) -> None:
+        self._push(undo.ChooseFace(self.service, entry_id, photo_id, old, new, **self._callbacks()))
+        self.refresh(entry_id)
+        self.changed.emit()
 
     def toggle_excluded(self) -> None:
         """The 🚫 button: stop using this photo for matching, or start using it again."""
@@ -926,11 +1255,11 @@ class LibraryPage(QWidget):
         if ref is None or self.entry is None:
             self.exclude_btn.setChecked(False)
             return
-        self._flush_photo_order()
-        entry_id, photo_id, excluded = self.entry.id, ref.photo_id, ref.face is None
+        self.commit_edits()
+        entry_id, photo_id, before = self.entry.id, ref.photo_id, ref.face
 
         def work():
-            if not excluded:
+            if before is not None:
                 return self.service.choose_face(entry_id, photo_id, None)
             _img, faces = self.service.detect_faces(photo_id)
             if not faces:
@@ -941,10 +1270,9 @@ class LibraryPage(QWidget):
             if result is None:
                 QMessageBox.information(self, "Photo", "No face could be found in this photo, so it cannot be "
                                                        "used for matching.")
-            self.entry = self.service.get_entry(entry_id)
-            self._load_photos()
-            self.refresh(entry_id)
-            self.changed.emit()
+                self.refresh(entry_id)
+                return
+            self._face_changed(entry_id, photo_id, before, result.face)
 
         self.runner.submit(work, on_done=done)
 
@@ -954,38 +1282,34 @@ class LibraryPage(QWidget):
             return
         if confirm(self, "Remove photo", "Move this photo to the Trash? You can restore it later.",
                    "Move to Trash"):
-            self._flush_photo_order()
-            self.service.remove_photo(self.entry.id, ref.photo_id)
-            self.refresh(self.entry.id)
-            self.changed.emit()
+            self.commit_edits()
+            self._push(undo.RemovePhoto(self.service, self.entry.id, ref.photo_id, **self._callbacks()))
 
     # --- entry actions ------------------------------------------------------------------------------------
 
     def new_entry(self) -> None:
+        self.commit_edits()
         name, ok = QInputDialog.getText(self, "New entry", "Name:")
         if ok and name.strip():
             e = self.service.create_entry(name.strip())
-            self._set_dirty(False)
+            self._push(undo.NewEntry(self.service, e.id, **self._callbacks()))
             self.refresh(e.id)
             self.select_entry(e.id)
-            self.set_editing(True)
             self.changed.emit()
 
     def delete_entry(self) -> None:
         if self.entry is None:
             return
+        self.commit_edits()
         e = self.entry
         if confirm(self, "Delete entry", f"Move “{e.name}” and its {len(e.photos)} photo(s) to the Trash?\n"
                    "You can restore it from the Trash.", "Move to Trash", destructive=True):
-            self.service.delete_entry(e.id)
-            self.entry = None
-            self._set_dirty(False)
-            self.refresh()
-            self.changed.emit()
+            self._push(undo.DeleteEntry(self.service, e.id, **self._callbacks()))
 
     def export_entry(self) -> None:
         if self.entry is None:
             return
+        self.commit_edits()
         if not confirm(self, "Export entry",
                        "Export creates UNENCRYPTED copies of this entry's information and photos in a folder "
                        "you choose. Anyone with access to that folder can see them.\n\nContinue?",
@@ -997,6 +1321,7 @@ class LibraryPage(QWidget):
             QMessageBox.information(self, "Export", f"Exported to:\n{out}")
 
     def import_folder(self) -> None:
+        self.commit_edits()
         text = ("Choose a folder that contains one sub-folder per person. Each sub-folder holds that person's "
                 "photos and, optionally, an entry.json with fields such as name, aliases, tags and notes.\n\n"
                 "A folder that directly contains photos is imported as one person. Photos are copied into the "
@@ -1033,24 +1358,24 @@ class LibraryPage(QWidget):
     # --- misc -------------------------------------------------------------------------------------------------
 
     def clear(self) -> None:
+        """Forget everything shown, and the undo history (locking, or another database)."""
+        if self._editing():
+            self._active.finish(False)
+        self._active = None
+        self.undo_stack.clear()
         self.entry = None
-        self._dirty = False
-        self.editing = False
-        self._pending_order = None
+        self._body_key = None
         self.list.clear()
         self.photos.clear()
         self.filter.clear()
-        self.name_edit.clear()
-        self.title.setText("")
+        for inline in (self.title, self.aliases_text, self.tags_text):
+            inline.set_text("")
+            inline.editor.clear()
         self.count.setText("")
-        self._rows = []
-        for body in (self.view_body, self.edit_body):
-            while body.count() > 1:
-                item = body.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
+        self.stamps.setText("")
+        self._rows, self._divider = {}, None
+        while self.body.count() > 1:
+            item = self.body.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         self._show_entry(False)
-
-    @property
-    def has_unsaved_changes(self) -> bool:
-        return self._dirty

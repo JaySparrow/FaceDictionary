@@ -357,6 +357,32 @@ def test_global_and_own_fields(svc):
     assert "Met at" not in [f.name for f in svc.get_entry(b.id).own]
 
 
+def test_a_removed_shared_field_can_be_put_back(svc):
+    """What undo needs: the same field id, in the same place, with every entry's text back in it."""
+    a, b = svc.list_entries()[0], svc.list_entries()[1]
+    existing = [f.id for f in svc.global_fields()]
+    city = svc.add_global_field("City")
+    hobby = svc.add_global_field("Hobby")
+    a.fields[city.id] = "Lisbon"
+    svc.update_entry(a)
+    b.fields[city.id] = ""
+    b.own.append(OwnField("City", "already mine"))
+    svc.update_entry(b)
+    removed = svc.drop_global_field(city.id)
+    assert removed.position == len(existing) and removed.converted == [a.id]
+    assert removed.values == {a.id: "Lisbon", b.id: ""}
+    assert [f.id for f in svc.global_fields()] == existing + [hobby.id]
+    assert svc.get_entry(a.id).own_field("City").value == "Lisbon"
+    svc.reinstate_global_field(removed)
+    assert [f.id for f in svc.global_fields()] == existing + [city.id, hobby.id]        # same id, same place
+    back = svc.get_entry(a.id)
+    assert back.fields[city.id] == "Lisbon" and back.own_field("City") is None
+    assert svc.get_entry(b.id).own_field("City").value == "already mine"       # not made by the removal
+    with pytest.raises(ServiceError):
+        svc.reinstate_global_field(removed)                                  # it is there already
+    assert svc.drop_global_field("0" * 32) is None
+
+
 def test_search_entries_by_scope(svc):
     field = svc.add_global_field("City")
     a, b = svc.list_entries()[0], svc.list_entries()[1]
@@ -372,6 +398,20 @@ def test_search_entries_by_scope(svc):
     assert svc.search_entries("lisbon", scope="name") == []
     assert [e.id for e in svc.search_entries("lis", scope=field.id)] == [a.id]
     assert len(svc.search_entries("")) == len(svc.list_entries())
+
+
+def test_photo_notes_survive_export_and_import(svc, tmp_path):
+    entry = svc.list_entries()[0]
+    first = entry.photos[0].photo_id
+    assert svc.set_photo_note(entry.id, first, "  at the lake  ").note == "at the lake"
+    out = svc.export_entry(entry.id, tmp_path / "export")
+    doc = json.loads((out / "entry.json").read_text("utf-8"))
+    assert list(doc["photo_notes"].values()) == ["at the lake"]
+    svc.delete_entry(entry.id)
+    svc.import_folder(out.parent)
+    back = svc.find_entry_by_name(entry.name)
+    assert [p.note for p in back.photos if p.note] == ["at the lake"]
+    assert "photo_notes" not in [f.name for f in back.own]                 # not turned into a field
 
 
 def test_photo_order_sets_the_cover(svc):

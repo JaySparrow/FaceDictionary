@@ -7,10 +7,11 @@ from typing import Callable
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QBuffer, QIODevice, QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import (QBuffer, QIODevice, QObject, QPointF, QRectF, QRunnable, QSettings, QSize, Qt,
+                            QThreadPool, Signal)
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar,
-                               QSizePolicy, QVBoxLayout, QWidget)
+                               QSizePolicy, QWidget)
 
 from ..imageio import SUPPORTED_EXTENSIONS
 from ..vault import VaultLockedError
@@ -171,39 +172,6 @@ def rounded(pm: QPixmap, radius: int = 8) -> QPixmap:
 
 # --- widgets ----------------------------------------------------------------------------------
 
-class ImageView(QLabel):
-    """Shows a pixmap scaled to fit, keeping the aspect ratio."""
-
-    def __init__(self, min_size: QSize = QSize(200, 200), parent=None):
-        super().__init__(parent)
-        self._pixmap = QPixmap()
-        self.setMinimumSize(min_size)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-    def set_image(self, pm: QPixmap | None) -> None:
-        self._pixmap = pm if pm is not None else QPixmap()
-        self._rescale()
-
-    def clear_image(self) -> None:
-        self._pixmap = QPixmap()
-        super().clear()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._rescale()
-
-    def _rescale(self) -> None:
-        if self._pixmap.isNull():
-            super().clear()
-            return
-        ratio = self.devicePixelRatioF()
-        scaled = self._pixmap.scaled(self.size() * ratio, Qt.AspectRatioMode.KeepAspectRatio,
-                                     Qt.TransformationMode.SmoothTransformation)
-        scaled.setDevicePixelRatio(ratio)
-        self.setPixmap(scaled)
-
-
 class ClickableLabel(QLabel):
     """A label that behaves like a link."""
 
@@ -244,7 +212,7 @@ class ElidedLabel(QLabel):
     def _update(self) -> None:
         from PySide6.QtGui import QFontMetrics
         super().setText(QFontMetrics(self.font()).elidedText(self.full_text, Qt.TextElideMode.ElideRight,
-                                                            max(40, self.width())))
+                                                            max(40, self.contentsRect().width() - 8)))
 
 
 class ScoreBar(QProgressBar):
@@ -262,16 +230,101 @@ class ScoreBar(QProgressBar):
                            f"font-size: 11px; }} QProgressBar::chunk {{ background: {color}; border-radius: 4px; }}")
 
 
-def icon_button(symbol: str, tooltip: str, size: int = 30, checkable: bool = False):
-    """A small square button with a symbol; the words live in the tooltip."""
-    from PySide6.QtWidgets import QPushButton
-    b = QPushButton(symbol)
+# --- one set of thin monochrome line icons, drawn on a 24-unit grid (in the manner of Lucide) ---------
+
+def _path(*points) -> QPainterPath:
+    path = QPainterPath()
+    path.moveTo(*points[0])
+    for pt in points[1:]:
+        path.lineTo(*pt)
+    return path
+
+
+def _draw_icon(p: QPainter, name: str) -> None:
+    if name in ("plus", "minus"):
+        p.drawLine(QPointF(5, 12), QPointF(19, 12))
+        if name == "plus":
+            p.drawLine(QPointF(12, 5), QPointF(12, 19))
+    elif name == "ban":
+        p.drawEllipse(QPointF(12, 12), 9, 9)
+        p.drawLine(QPointF(5.6, 5.6), QPointF(18.4, 18.4))
+    elif name == "trash":
+        p.drawLine(QPointF(3, 6), QPointF(21, 6))
+        p.drawPath(_path((5.5, 6), (6.5, 21), (17.5, 21), (18.5, 6)))
+        p.drawPath(_path((9, 6), (9, 3), (15, 3), (15, 6)))
+        p.drawLine(QPointF(10, 10.5), QPointF(10, 16.5))
+        p.drawLine(QPointF(14, 10.5), QPointF(14, 16.5))
+    elif name == "settings":                                   # two sliders
+        p.drawLine(QPointF(3, 7), QPointF(4, 7))
+        p.drawLine(QPointF(10, 7), QPointF(21, 7))
+        p.drawEllipse(QPointF(7, 7), 3, 3)
+        p.drawLine(QPointF(3, 17), QPointF(14, 17))
+        p.drawLine(QPointF(20, 17), QPointF(21, 17))
+        p.drawEllipse(QPointF(17, 17), 3, 3)
+    elif name == "lock":
+        p.drawRoundedRect(QRectF(4.5, 11, 15, 10), 2, 2)
+        shackle = QPainterPath()
+        shackle.moveTo(8, 11)
+        shackle.lineTo(8, 7)
+        shackle.arcTo(QRectF(8, 3, 8, 8), 180, -180)
+        shackle.lineTo(16, 11)
+        p.drawPath(shackle)
+    elif name in ("import", "export"):                         # a tray with an arrow into it, or out of it
+        p.drawPath(_path((3, 15), (3, 21), (21, 21), (21, 15)))
+        p.drawLine(QPointF(12, 3), QPointF(12, 15))
+        if name == "import":
+            p.drawPath(_path((7, 10), (12, 15), (17, 10)))
+        else:
+            p.drawPath(_path((7, 8), (12, 3), (17, 8)))
+    else:
+        raise ValueError(f"no icon called {name!r}")
+
+
+_ICONS: dict[str, QIcon] = {}
+
+
+def line_icon(name: str):
+    """A thin line icon in the text colour of the current palette (lighter when disabled)."""
+    from PySide6.QtGui import QGuiApplication, QPalette
+    if name in _ICONS:
+        return _ICONS[name]
+    palette = QGuiApplication.palette()
+    icon = QIcon()
+    for mode, group in ((QIcon.Mode.Normal, QPalette.ColorGroup.Active),
+                        (QIcon.Mode.Disabled, QPalette.ColorGroup.Disabled)):
+        color = palette.color(group, QPalette.ColorRole.ButtonText)
+        if mode == QIcon.Mode.Disabled:
+            color.setAlpha(110)
+        for size in (16, 18, 20, 24):
+            for ratio in (1, 2, 3):
+                pm = QPixmap(size * ratio, size * ratio)
+                pm.setDevicePixelRatio(ratio)
+                pm.fill(Qt.GlobalColor.transparent)
+                p = QPainter(pm)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                p.scale(size / 24, size / 24)
+                pen = QPen(color, 2)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                _draw_icon(p, name)
+                p.end()
+                icon.addPixmap(pm, mode)
+    _ICONS[name] = icon
+    return icon
+
+
+def icon_button(icon: str, tooltip: str, size: int = 28, checkable: bool = False):
+    """A small borderless button with a line icon; the words live in the tooltip."""
+    from PySide6.QtWidgets import QToolButton
+    b = QToolButton()
+    b.setObjectName("icon")
+    b.setIcon(line_icon(icon))
+    b.setIconSize(QSize(18, 18) if size >= 26 else QSize(16, 16))
     b.setToolTip(tooltip)
     b.setFixedSize(size, size)
     b.setCheckable(checkable)
-    f = b.font()
-    f.setPointSize(15)
-    b.setFont(f)
     return b
 
 
@@ -296,6 +349,21 @@ def mark_excluded(pm: QPixmap, size: int) -> QPixmap:
     return out
 
 
+def mark_cover(pm: QPixmap, size: int) -> QPixmap:
+    """Frame a thumbnail: this photo is the entry's cover."""
+    from PySide6.QtGui import QGuiApplication, QPalette
+    out = QPixmap(pm)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    width = max(2.0, 3.0 * out.width() / max(1, size))
+    p.setPen(QPen(QGuiApplication.palette().color(QPalette.ColorRole.Text), width))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    half = width / 2
+    p.drawRect(QRectF(half, half, out.width() - width, out.height() - width))
+    p.end()
+    return out
+
+
 HEADER_HEIGHT = 38
 
 
@@ -306,7 +374,7 @@ def header_row(title: str, *widgets, size: int = 15) -> QWidget:
     bar.setFixedHeight(HEADER_HEIGHT)
     lay = QHBoxLayout(bar)
     lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(6)
+    lay.setSpacing(GAP)
     if title:
         lay.addWidget(heading(title, size))
     lay.addStretch(1)
@@ -372,6 +440,11 @@ def make_labels_selectable(root) -> None:
             make_selectable(label)
 
 
+def has_focus_in(widget, focus) -> bool:
+    """The keyboard focus is on `widget` or inside it (a list's viewport, say)."""
+    return focus is not None and (focus is widget or widget.isAncestorOf(focus))
+
+
 def card() -> QFrame:
     f = QFrame()
     f.setObjectName("card")
@@ -380,11 +453,23 @@ def card() -> QFrame:
 
 def heading(text: str, size: int = 15) -> QLabel:
     lbl = QLabel(text)
-    f = lbl.font()
-    f.setPointSize(size)
-    f.setBold(True)
-    lbl.setFont(f)
+    lbl.setFont(semibold(lbl.font(), size))
     return make_selectable(lbl)
+
+
+def semibold(font, size: int | None = None):
+    """The one emphasis the app uses: semibold, never bold."""
+    from PySide6.QtGui import QFont
+    f = QFont(font)
+    if size is not None:
+        f.setPointSize(size)
+    f.setWeight(QFont.Weight.DemiBold)
+    return f
+
+
+PAGE_MARGIN = 24                  # around every page
+GUTTER = 24                       # between the columns of a page
+GAP = 8                           # between the parts of a column
 
 
 def muted(text: str = "") -> QLabel:
@@ -392,18 +477,6 @@ def muted(text: str = "") -> QLabel:
     lbl.setObjectName("muted")
     lbl.setWordWrap(True)
     return make_selectable(lbl)
-
-
-def vbox(*widgets, margins=(0, 0, 0, 0), spacing=6) -> QVBoxLayout:
-    lay = QVBoxLayout()
-    lay.setContentsMargins(*margins)
-    lay.setSpacing(spacing)
-    for w in widgets:
-        if isinstance(w, QWidget):
-            lay.addWidget(w)
-        else:
-            lay.addLayout(w)
-    return lay
 
 
 def confirm(parent, title: str, text: str, ok_text: str = "OK", destructive: bool = False) -> bool:
@@ -436,18 +509,25 @@ def _dialog_options() -> QFileDialog.Option:
     return QFileDialog.Option.DontUseNativeDialog
 
 
-def open_images(parent, title: str = "Choose photos", multiple: bool = True) -> list[str]:
+_LAST_FOLDERS: dict[str, str] = {}      # where each kind of photo dialog was last used; memory only, never saved
+
+
+def open_images(parent, title: str = "Choose photos", multiple: bool = True, kind: str = "photos") -> list[str]:
+    """Choose photos, starting in the folder the last dialog of this `kind` ended in."""
     from pathlib import Path
+    start = _LAST_FOLDERS.get(kind, "")
+    if not start or not Path(start).is_dir():
+        start = str(Path.home())
     try:
         if multiple:
-            paths, _ = QFileDialog.getOpenFileNames(parent, title, str(Path.home()), IMAGE_FILTER,
-                                                    options=_dialog_options())
+            paths, _ = QFileDialog.getOpenFileNames(parent, title, start, IMAGE_FILTER, options=_dialog_options())
         else:
-            path, _ = QFileDialog.getOpenFileName(parent, title, str(Path.home()), IMAGE_FILTER,
-                                                  options=_dialog_options())
+            path, _ = QFileDialog.getOpenFileName(parent, title, start, IMAGE_FILTER, options=_dialog_options())
             paths = [path] if path else []
     finally:
         _forget_dialog_history()
+    if paths:
+        _LAST_FOLDERS[kind] = str(Path(paths[0]).parent)
     return paths
 
 
@@ -461,13 +541,30 @@ def choose_folder(parent, title: str) -> str:
 
 
 STYLE = """
-QFrame#card { border: 1px solid palette(midlight); border-radius: 10px; background: palette(base); }
+QFrame#card { border: none; border-radius: 10px; background: palette(base); }
 QFrame#dropzone { border: 2px dashed palette(mid); border-radius: 14px; background: palette(base); }
 QFrame#dropzone[hover="true"] { border-color: palette(highlight); }
-QLabel#muted { color: palette(placeholder-text); }
+QLabel#muted { color: palette(placeholder-text); font-size: 12pt; }
 QLabel#banner { background: #fff3cd; color: #6b4e00; border-radius: 8px; padding: 8px 10px; }
-QListWidget#nav { border: none; background: transparent; font-size: 14px; }
-QListWidget#nav::item { padding: 8px 10px; border-radius: 8px; margin: 1px 6px; }
-QListWidget#nav::item:selected { background: palette(highlight); color: palette(highlighted-text); }
+QListWidget, QTreeWidget { border: none; background: transparent; outline: 0; }
+QListWidget::item, QTreeWidget::item { border: none; padding: 3px 4px; }
+QListWidget::item:selected, QTreeWidget::item:selected { background: palette(highlight);
+                                                          color: palette(highlighted-text); border-radius: 7px; }
+QListWidget::item:selected:!active, QTreeWidget::item:selected:!active { background: palette(midlight);
+                                                                          color: palette(text); }
+QTreeWidget::item:selected { border-radius: 0px; }
+QTreeWidget::item:selected:first { border-top-left-radius: 7px; border-bottom-left-radius: 7px; }
+QTreeWidget::item:selected:last { border-top-right-radius: 7px; border-bottom-right-radius: 7px; }
+QTreeWidget QHeaderView::section { background: transparent; border: none; border-bottom: 1px solid palette(midlight);
+                                    padding: 4px 4px; color: palette(placeholder-text); }
+QListWidget#nav { font-size: 14px; }
+QListWidget#nav::item { padding: 7px 10px; margin: 1px 6px; }
+QSplitter::handle { background: transparent; image: none; }
+QStatusBar { background: transparent; border: none; }
+QStatusBar::item { border: none; }
+QToolButton#icon { border: none; background: transparent; border-radius: 6px; }
+QToolButton#icon:pressed, QToolButton#icon:checked { background: rgba(127, 127, 127, 60); }
 QPushButton#primary { font-weight: 600; }
+QLabel[inline="true"] { padding: 1px 0px; }
+QLabel[inline="true"][empty="true"] { color: palette(placeholder-text); }
 """

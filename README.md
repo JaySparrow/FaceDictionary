@@ -25,17 +25,27 @@ app updates.
 
 | Page | What you can do |
 |---|---|
-| **Search** | Drop a photo on the frame, click it to choose a file, ⌘V to paste, ⌘O to open. Every face is searched; the largest is shown first. Click any face box (or its thumbnail, or ←/→, 1–9) to see that face's top five. Clicking a result's photo or name opens that entry; **✓ This is the person** adds the photo to its album, using that face. In a group photo you can confirm several faces for several people. |
+| **Search** | Drop a photo on the frame, click the empty frame or **+** to choose a file, ⌘V to paste, ⌘O to open. Every face is searched; the largest is shown first. Click any face box (or its thumbnail, or ←/→, 1–9) to see that face's top five. Clicking a result's photo or name opens that entry; **✓ This is the person** adds the photo to its album, using that face. In a group photo you can confirm several faces for several people. |
 | **History** | Every past search with the stored result of every face, exactly as it was — nothing is recomputed. Confirm or undo from here, or search the same photo again with the library as it is now. |
-| **Library** | An entry opens read-only; the pencil (✏️) turns it into the edit form, ✓ saves and ↩ discards. Beside name, aliases and tags you can add any fields you like. In edit mode **+**, **–** and **🚫** manage the album, and photos can be dragged: onto another photo to swap them, between two to insert. The first photo is the entry's cover. |
+| **Library** | Text reads like a label: **double-click** a name, alias, tag or field to change it (a click is enough where nothing is written yet), then press Enter or click elsewhere to save, or Esc to keep the old text; fields of several lines save with ⌘Enter. Right-click beside the fields (or use *Edit*) to add one. The three buttons above the album add photos (so do ⌘O and dropping photos on it), move the selected one to the Trash, or stop using it for matching; photos can be dragged onto another photo to swap them, or between two to insert. The first photo, framed, is the entry's cover. Double-click a photo to see it big, with a note of its own under it; in a photo with several faces, double-click the face to use for matching. |
 | **Trash** | Deleted entries, photos and searches wait here until you remove them for good (it asks twice). Nothing is ever deleted automatically. |
 
-Shortcuts: ⌘1–⌘4 switch pages · ⌘O open a photo · ⌘V paste · ⌘F find an entry · ⌘N new entry · ⌘L lock.
+Shortcuts: ⌘1–⌘4 switch pages · ⌘O open a photo · ⌘V paste · ⌘F find an entry · ⌘N new entry · ⌘L lock ·
+⌘Z / ⇧⌘Z undo and redo any change in the Library, step after step (also in *Edit*) ·
+⌫ deletes what is selected in the list or album you are in, as its delete button does.
 
-**Fields.** A *shared* field exists on every entry of the database, each with its own text; a field
-*only this entry* stays where you made it. Each field is one row whose box grows with the text.
+**Fields.** A *shared* field exists on every entry of the database, each with its own text (an empty
+one is shown dimmed, ready to fill in); a field *only in this entry* stays where you made it, below a
+thin line. *Add Field to All Entries* (⇧⌘;) and *Add Field to This Entry* (⌘;) are in the right-click
+menu and in *Edit*: type the name, press Enter and go on with its text. Double-click a field's name to
+rename it; clear its name, or right-click it and choose *Remove*, to remove it.
 Removing a shared field takes it off every entry, but text that was written in it is kept as a
-field of that entry, so nothing is lost.
+field of that entry, so nothing is lost — and ⌘Z puts it back.
+
+**Undo.** Every change in the Library — text, fields, photos added, removed, reordered or switched
+off, the face used in a photo, entries created or deleted — can be undone with ⌘Z, as many steps back
+as you like, and redone with ⇧⌘Z. Undoing an addition moves it to the Trash rather than deleting
+it. The history lives in memory only and is forgotten when the app locks.
 
 **Finding an entry.** The box above the list searches names, aliases, tags and every shared field at
 once; the drop-down next to it narrows the search to one of them.
@@ -60,8 +70,8 @@ commas, `，`, `、` and `;` all separate aliases and tags.
 | Data leaving the Mac | At start-up the app asks the macOS kernel to refuse every network call it makes, and replaces Python's socket functions as a second layer. It contains no network code. Only `scripts/fetch_models.py` downloads anything, and only the models. |
 | Data at rest | AES-256-GCM per file, under a random data key that your password unlocks (scrypt). File names are random ids; the folder is not synced by iCloud and not indexed by Spotlight. |
 | Tampering | Every file is authenticated, so a changed or swapped one is detected. *Settings → Check database integrity* verifies them all. |
-| Unattended app | Locks after five idle minutes or with ⌘L: keys, index and images leave memory, open dialogs close and unsaved edits are saved first. Locking never touches the files. |
-| Traces | No logs. Decrypted photos never reach the disk. The app's settings store only the window size, and Qt's file-dialog history is erased after every use. The paths (not the contents) of databases you opened are remembered so they can be offered at unlock; that list can be cleared from the unlock screen. |
+| Unattended app | Locks after five idle minutes or with ⌘L: keys, index, images and the undo history leave memory, open dialogs close and text being typed is saved first. Locking never touches the files. |
+| Traces | No logs. Decrypted photos never reach the disk. The app's settings store only the window size, and Qt's file-dialog history is erased after every use; the folder a photo dialog last opened is remembered only until the app quits. The paths (not the contents) of databases you opened are remembered so they can be offered at unlock; that list can be cleared from the unlock screen. |
 | Losing data | Deleting moves things to the Trash; all writes are atomic; rebuilding the index only rewrites caches; one window at a time may open a database. |
 | Forgotten password | Answer the security questions (any two of three by default). A printed recovery code is available as a second method in *Settings*. Anyone who can answer the questions can open that database, so choose answers only you know — they need not be true. |
 
@@ -93,7 +103,7 @@ conda env create -f environment.yml
 conda activate facedict
 python scripts/fetch_models.py      # ~53 MB, verified by SHA-256
 ./run.command                       # start the app
-python -m pytest                    # ~140 tests; temp databases only, GUI runs offscreen
+python -m pytest                    # ~160 tests; temp databases only, GUI runs offscreen
 ```
 
 Command line: `python -m facedict query PHOTO [--face N]`, `import FOLDER`, `evaluate`, `verify`;
@@ -104,7 +114,9 @@ demo database of 150 people (password `demo-password`) that `./run_demo.command`
 photos that are deliberately *not* in it.
 
 Building the app and the installer: see [docs/packaging.md](docs/packaging.md).
-The design decisions and their history are in [docs/design-notes.md](docs/design-notes.md) (in Chinese).
+The design decisions and their history are in [docs/design-notes.md](docs/design-notes.md), plans for larger
+changes in [docs/plans/](docs/plans/), and the operating hints that were taken out of the interface in
+[docs/in-app-hints.md](docs/in-app-hints.md) (all in Chinese).
 
 ## Layout
 
@@ -115,7 +127,7 @@ facedict/
   databases.py  the list of databases                imageio.py  in-memory decoding (HEIC, EXIF)
   engine.py     YuNet + alignment + ArcFace/SFace    index.py    embeddings, top-k per entry
   service.py    application logic                    evaluate.py leave-one-out accuracy
-  gui/          the PySide6 interface
+  gui/          the PySide6 interface; undo.py holds the undo history of the Library
 scripts/        fetch_models · prepare_testdata · build_demo · build_app
 packaging/      PyInstaller spec, icon, dmg settings
 tests/          unit, integration and GUI tests
